@@ -22,6 +22,7 @@ class Adslab:
             
         self.origin = f"{parsed_url.scheme}://{parsed_url.netloc}"
         self.referer = siteurl
+        self.hostname = parsed_url.netloc
         
         self.cookies = {}
         if cookies:
@@ -73,17 +74,19 @@ class Adslab:
         return token
 
     def _init_captcha(self):
-        url = "https://api.adslab.me/v1/alcaptcha/init"
+        # KITA UBAH URL-NYA DI SINI: Gunakan domain utama adslab.me
+        url = "https://adslab.me/v1/alcaptcha/init"
         payload = {
             "sitekey": self.sitekey, "subid": self.subid,
-            "domain": self.origin.replace("https://", "").replace("http://", "")
+            "domain": self.hostname
         }
         resp = self.session.post(url, json=payload, headers=self.headers, timeout=30)
         if resp.status_code != 200: raise AdslabError(f"Init failed HTTP {resp.status_code}: {resp.text[:100]}")
         return resp.json()
 
     def _verify(self, challenge_id, answers):
-        url = "https://api.adslab.me/v1/alcaptcha/verify"
+        # KITA UBAH URL-NYA DI SINI: Gunakan domain utama adslab.me
+        url = "https://adslab.me/v1/alcaptcha/verify"
         payload = {
             "challenge_id": challenge_id, "sitekey": self.sitekey,
             "subid": self.subid, "answers": answers
