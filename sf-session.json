@@ -1,0 +1,14 @@
+{
+ "proxy": null,
+ "no_proxy": true,
+ "cookies": {
+  "csrf_cookie_name": "72aaa906c9adfe4e4353ae512dcbd4b5",
+  "ci_session": "jc8prg5c9v951aq0plj9m4sm0s5qq8u9",
+  "uf": "45067890a0c09b4ae9c0ee181c3c3556",
+  "utt": "Asia/Jakarta",
+  "ls": "id-ID,id,en-US,en",
+  "AccountReady": "4124cda5d39df97cd959ef439773754b688d35647d9223e36fb1ac146975c048"
+ },
+ "fp": "45067890a0c09b4ae9c0ee181c3c3556",
+ "email": "chusmyoh@gmail.com"
+}

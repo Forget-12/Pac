@@ -1,0 +1,9 @@
+{
+ "proxy": "http://N9MNrSuT:PEVxW4oEp7_session-PhmVYz_lifetime-60_country-FR@proxy.proxying.io:8080",
+ "label": "FR-resi",
+ "cookies": {
+  "csrf_cookie_name": "16978e712e3e3c9d6969e09d94212531",
+  "ci_session": "1hp1sdtni9mi7e4vr9f5bo9nj7fhqg04"
+ },
+ "html_csrf": true
+}

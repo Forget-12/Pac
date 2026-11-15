@@ -1,0 +1,5 @@
+{
+  "solver_max_active": 1,
+  "solver_max_queue": 6,
+  "task_timeout": 60000
+}

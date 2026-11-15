@@ -1,0 +1,16 @@
+{
+ "cookies": {
+  "csrf_cookie_name": "33c88e6088598e73ee0cac42a0fc29ff",
+  "ci_session": "ut2bvi36j2jvl71rr11sf5fojk2eab8d",
+  "uf": "9587b2f6665a86e17d2f489d7c426e4e",
+  "utt": "Europe/Paris",
+  "ls": "fr-FR,fr,en-US,en",
+  "AccountReady": "121fa20111e72116aac2ba9c1a240738461422b26bf8edc12d1dab2087a9424a"
+ },
+ "fp": "9587b2f6665a86e17d2f489d7c426e4e",
+ "email": "gi2h370@gmail.com",
+ "tz": "Europe/Paris",
+ "langs": "fr-FR,fr,en-US,en",
+ "proxy": "http://acbcb24e410dbeb9-geo-fr-sess-vh9g887x-life-7200:8654fd49a819de6a@gate-eu.vaultproxies.com:80",
+ "proxy_idx": 8
+}

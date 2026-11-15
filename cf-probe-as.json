@@ -1,0 +1,16 @@
+{
+ "ok": false,
+ "url": "https://satoshifaucet.io/faucet/currency/ltc",
+ "title": "Just a moment...",
+ "has_csrf": false,
+ "has_login": false,
+ "clearance": true,
+ "cookies": {
+  "cf_chl_rc_ni": "2",
+  "ci_session": "ui8oi3gcv5mqq64aem1junpju2gd9g23",
+  "csrf_cookie_name": "efb19541a2bab795a255c68c324f2c5b",
+  "cf_clearance": "Cn0hvjiJ4yBqjEQvqxVWHcjF_ekv5_AUeLKSd3WkiOCsVy2N_xE5_ApTtMG5A3Geo48LlTqVe2pGpV6dTwGKoMVvQzVc7K1kB5ZWN3J5x5tUXkM9hV5yxUhC7DVokHsbp8WPrDvAWLcJqtlKmak9xptzQWcZomIpOdCVhVYbF2eaN-Oa9-1sO4fKY2Cdt2lomjs1x-SEY9IPWnyullhNwj4fkRygiEaCAyNBO_Hw1zMaloBOxZNOU8o6XxYUMg8m72gPeMmcIl-Q1aaTbkSlu1D2ucibXv18JRWsj6ChISoD3VlhWJYexQwTVJwUfBoZwAa0tAGcqJ6MkcBPJg76gNX5bZt9P6duvhnRBnyMjtrx30dYkKlnvGs0BgIYZe8f2OTsLpdytmkbP4_dI1ukGtotNivJk8RNaDOiAILixFGjDr0v"
+ },
+ "body": "satoshifaucet.io\nPerforming security verification\n\nThis website uses a security service to protect against malicious bots. This page is displayed while the website verifies you are not a bot.\n\nRay ID: a59531160f3450fc\nPerformance and Security by Cloudflare\nPrivacy",
+ "ts": "2026-11-12T11:28:59.672Z"
+}

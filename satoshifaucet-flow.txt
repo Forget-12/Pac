@@ -1,0 +1,185 @@
+================================================================
+ANALISIS SATOSHIFAUCET.IO — FLOW LENGKAP
+Analisa: 11 Nov 2026 | Metode: fetch langsung + bedah HTML/JS
+================================================================
+
+[1] RINGKASAN SITUS
+----------------------------------------------------------------
+URL             : https://satoshifaucet.io
+Jenis           : Multi-coin faucet, payout instan ke FaucetPay
+Framework       : CodeIgniter 4 (indikator: field form "csrf_token_name")
+CDN/Proteksi    : Cloudflare (challenge "Just a moment" pada halaman protected)
+Cloudflare Turn : TIDAK ADA (site TIDAK memakai Turnstile)
+Captcha         : AdsLab Captcha (adslab.me) — SINGLE option, tidak bisa dipilih lain
+Interval claim  : "Earn free coin every 10 Seconds" (faucet cepat)
+Koin didukung   : LTC, TON, DOGE, BCH, USDT, TRX, BNB, ETH, SOL, USDC,
+                  TRUMP, PEPE, XMR, XLM, DASH, DGB, FEY, ZEC, XRP, POL, ADA (21 koin)
+Kebijakan       : NO VPN/Proxy ("you cannot use any proxied connection")
+                  Multi-account = auto-ban oleh security system
+Referral        : 30% dari referral
+
+[2] STRUKTUR HALAMAN / ENDPOINT
+----------------------------------------------------------------
+/               : Homepage + form LOGIN (status HTTP 200, TANPA challenge CF)
+/faucet         : Halaman claim -> HTTP 403 "Just a moment..." (Cloudflare
+                  Managed Challenge untuk client non-browser)
+/auth/login     : POST target form login
+/robots.txt     : ada (content-signal policy)
+/sitemap.xml    : 404
+
+[3] FORM LOGIN (homepage, action="https://satoshifaucet.io/auth/login")
+----------------------------------------------------------------
+Field lengkap:
+  wallet            : (input email) FaucetPay email — NAMA FIELDNYA "wallet", bukan "email"
+  csrf_token_name   : token CSRF CodeIgniter, contoh 25f4e63922c7eb2cf7dc67992311b414
+                      (harus di-scrape tiap sesi, berubah-ubah)
+  ls                : honeypot field (nilai acak, contoh "kfw7Uevi")
+  uf                : honeypot field (kosong)
+  utt               : honeypot field (timestamp-ish, contoh "1794381054")
+  captcha           : pilihan captcha dari dropdown (hidden) -> "adslab"
+  alcaptcha-response: token hasil AdsLab Captcha (di-inject JS setelah solve)
+
+CATATAN ANTI-BOT:
+  - ls / uf / utt kemungkinan honeypot / fingerprint antara.
+    Automasi harus mempertahankan nilai asli yang dirender server,
+    TIDAK mengosongkan / mengubah nilai yang sudah ada (kecuali uf
+    yang memang dirender kosong).
+  - CSRF wajib fresh: GET homepage -> ambil csrf_token_name ->
+    kirim di POST login yang sama sesi cookie.
+
+[4] FLOW LOGIN LENGKAP
+----------------------------------------------------------------
+Langkah 0  : GET https://satoshifaucet.io/
+             -> simpan cookies, ambil csrf_token_name, ls, uf, utt
+Langkah 1  : Render/parse widget AdsLab:
+             <div class="adslab-captcha" data-sitekey="lA0LtcfCXUxnBWifcQrqRsmPi6sSV3HtrpyRodRg">
+             SITEKEY (berbeda format dari Turnstile, TIDAK diawali 0x):
+               lA0LtcfCXUxnBWifcQrqRsmPi6sSV3HtrpyRodRg
+Langkah 2  : Solve AdsLab Captcha (detail di [5]) -> dapat token
+Langkah 3  : POST https://satoshifaucet.io/auth/login
+             body form-urlencoded:
+               wallet=<email>
+               csrf_token_name=<dari langkah 0>
+               ls=<dari langkah 0>
+               uf=<dari langkah 0, kosong>
+               utt=<dari langkah 0>
+               captcha=adslab
+               alcaptcha-response=<token>
+             dengan cookies sesi + header browser normal
+Langkah 4  : Respons login -> redirect / dashboard session.
+
+[5] FLOW ADSLAB CAPTCHA (widget.js v=1 — dibedah dari source)
+----------------------------------------------------------------
+5.1 Widget di-inject oleh https://adslab.me/api/v1/alcaptcha/widget.js?v=1
+    Init otomatis untuk semua elemen .alcaptcha / .adslab-captcha
+    yang punya atribut:
+      data-sitekey = sitekey publik site
+      data-subid   = opsional, default "widget_user"
+5.2 UI: kotak 300x100px "press & hold" dengan progress circle.
+    User tahan tombol ~beberapa detik (fungsi startHold/completeHold,
+    animasi stroke-dashoffset 0.1s linear).
+5.3 Setelah hold selesai -> muncul iframe challenge:
+      https://adslab.me/alcaptcha?sitekey=<sitekey>
+                              &domain=<hostname parent>
+                              &subid=<subid>
+    (domain parent otomatis = window.location.hostname, jadi
+     request HARUS tampak datang dari satoshifaucet.io)
+5.4 Challenge di dalam iframe (potongan script iklan juga aktif:
+    sads.adsboosters.xyz — model captcha ini berbasis interaksi iklan)
+5.5 Selesai -> iframe kirim postMessage ke parent: { token: ... }
+5.6 Widget menulis token ke hidden input:
+      <input name="alcaptcha-response" value="<token>">
+    + dispatch CustomEvent "alcaptcha-success"
+5.7 Token ini yang divalidasi server saat POST /auth/login.
+
+IMPLIKASI AUTOMASI:
+  - TIDAK kompatibel dengan solver Turnstile现有 (gi7ltc/gi8 Railway).
+  - Perlu solver baru berbasis puppeteer-real-browser yang:
+      a) buka halaman host dengan domain benar (atau intercept
+         navigasi seperti turnstile.js, tapi iframe adslab cek
+         "domain" param = hostname parent),
+      b) auto "press & hold" (mouse down + tunggu ~3-5 detik + up),
+      c) tunggu iframe/postMessage token, ambil alcaptcha-response.
+
+[6] FLOW CLAIM SETELAH LOGIN (estimasi, halaman dibalik CF challenge)
+----------------------------------------------------------------
+Sesudah login sukses:
+  1. Akses /faucet (atau dashboard) -> di sini Cloudflare Managed
+     Challenge AKTIF (terbukti 403 "Just a moment" via plain HTTP).
+     Artinya: automasi berbasis HTTP biasa (requests/curl_cffi) TIDAK
+     akan lolos ke halaman claim tanpa cf_clearance cookies yang
+     didapat browser asli/chromium.
+  2. Faucet: pilih koin, tunggu timer, klik claim, captcha lagi
+     (kemungkinan AdsLab juga), POST claim.
+  3. Payout instan ke FaucetPay.
+
+[7] PERBANDINGAN DENGAN PANDAFAUCET (target script berjalan)
+----------------------------------------------------------------
+                          Pandafaucet        Satoshifaucet.io
+  Captcha                 Turnstile (0x...)  AdsLab (bukan 0x...)
+  Cloudflare challenge    Tidak menghalangi  YA, di /faucet (protected)
+  Login                   email+password     email saja + captcha (field "wallet")
+  CSRF                    Tidak ada          Wajib (csrf_token_name)
+  Honeypot fields         Tidak ada          ls, uf, utt
+  VPN/Proxy               "A VPN is fine"    DILARANG keras
+  Multi-account           Diperbolehkan      Auto-ban
+  Interval                ~20 menit          ~10 detik (klaim cepat)
+  Kompatibel script       pandax9-all6.py    BELUM ADA solver AdsLab
+
+[8] KESIMPULAN & REKOMENDASI
+----------------------------------------------------------------
+1. Automasi HTTP murni (pola pandax9) TIDAK cukup untuk
+   satoshifaucet.io karena:
+   a) Captcha AdsLab butuh browser (hold + iframe challenge).
+   b) Halaman claim dibalik Cloudflare Managed Challenge
+      (butuh browser utk dapat cf_clearance).
+2. Jalur automasi realistis: puppeteer-real-browser FULL page
+   (mirip pendekatan app.js/turnstile.js) yang:
+   - buka homepage asli (bukan intercept) agar domain/sesi CF benar,
+   - isi email, hold captcha, tunggu token, submit,
+   - halaman /faucet: biarkan browser melewati CF challenge,
+   - claim di dalam browser.
+3. Risiko tinggi: kebijakan NO PROXY + auto-ban multi-account
+   -> 1 akun = 1 fingerprint/IP residential; skala kaki akan
+   cepat terdeteksi dibanding pandafaucet.
+4. Sitekey AdsLab saat analisa:
+   lA0LtcfCXUxnBWifcQrqRsmPi6sSV3HtrpyRodRg
+   (format beda dgn Turnstile; jangan pakai regex 0x4AAAA utk site ini)
+5. Field-form regex ekstraksi yang robust:
+   csrf_token_name\s*=\s*["']([0-9a-f]{32})["']
+   name="wallet"\s*  (bukan name="email")
+   data-sitekey="([0-9A-Za-z]{20,64})"
+
+================================================================
+EOF
+
+[9] UPDATE HASIL EKSPERIMEN LOGIN (11 Nov 2026) — script satoshifaucet.py
+----------------------------------------------------------------
+Yang SUDAH LOLOS:
+  1. GET / -> csrf_token_name + ci_session cookies        : OK
+  2. Fingerprint check -> simulasi cookies+field:
+     uf  = visitorId hex-32 (FingerprintJS v4 open-source,
+           dihitung LOKAL di browser, tak bisa divalidasi server)
+     utt = timezone (Asia/Jakarta)                        : OK
+     ls  = languages (id-ID,id,en-US,en)                  : OK
+  3. AdsLab captcha solved via Tertuyul API
+     (method=adslab, pageurl trailing slash)              : OK (~20 detik)
+  4. POST /auth/login -> 303 (form valid, captcha valid)  : OK
+
+BLOKIR TERAKHIR:
+  Server menolak dengan pesan "VPN & Proxy Detected!"
+  -> Bukan bug script. IP user (AS58821 PT Lintas Jaringan Nusantara,
+     Jambi, ID) diklasifikasi hosting=true oleh database reputasi IP
+     (dites: ip-api.com hosting=true, meski proxycheck/scamalytics bilang
+     bersih). Faucet sites lazim memblokir kelas IP hosting/datacenter.
+  -> CATATAN: script sama sempat dapat 2 error berbeda:
+     - kirim ls/uf/utt nilai server-rendered  -> "browser up to date..." (generic)
+     - kirim nilai fingerprint simulasi       -> lolos check fingerprint,
+                                                 berhenti di check VPN/IP
+     Jadi urutan validasi server: csrf -> captcha -> fingerprint -> IP reputation.
+
+SOLUSI YANG REALISTIS:
+  a. Jalankan dari IP seluler/hotspot (mobile=true, hosting=false)
+     -> paling mungkin lolos tanpa melanggar kebijakan.
+  b. IP dinamis ISP? restart router utk dapat blok IP lain.
+  c. Resi proxy: melanggar ToS situs + risiko auto-ban -> tidak disarankan.

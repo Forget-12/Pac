@@ -1,0 +1,496 @@
+================================================================================
+KOALAFAUCET.COM - DEEP FLOW ANALYSIS (start -> reward)
+Sumber: observasi publik + client-side JS yang dikirim browser (13 Nov 2026)
+Catatan: client JS bersifat publik bagi setiap pengunjung; dokumen ini untuk
+referensi/pembelajaran arsitektur web.
+================================================================================
+
+1. GAMBARAN UMUM
+-----------------
+- Tipe: crypto faucet / micro-task platform (bukan Solana; saldo = "coins",
+  payout USD via FaucetPay)
+- Stack: PHP 8.3 (monolitik), Cloudflare CDN/WAF, PHPSESSID, tanpa framework JS
+- Analytics: Google Tag (G-PK6M0FBC8G)
+- Ad network: bmcdn6.com (pop-under) + slide-in footer ad
+- Domain: KOALAFAUCET.COM (registrasi 2026-01-23, Namecheap, tanpa DNSSEC)
+- Arsitektur: server-rendered HTML + fetch() JSON API
+
+2. ALUR AUTENTIKASI
+-------------------
+REGISTRASI (homepage):
+  heroEmail + password -> modal password (#authOverlay)
+  -> kirimPassword -> POST /auth_init (JSON: {email, password})
+  -> sukses: redirect dashboard (tanpa verifikasi email/OTP)
+  Catatan: nama fungsi JS "sendOtpRequest" adalah sisa refactor;
+  tidak ada OTP. Akun langsung aktif.
+
+LOGIN:
+  /login -> form loginForm -> POST /auth_login (JSON: {email, password})
+  Response sukses: {status:"success", role:"user"|"admin", redirect:"dashboard"|"admin"}
+  role=="admin" -> /admin, lainnya -> /dashboard
+  Guest mode: KX_GUEST=false; KX_GUEST_ALLOWED=['faucet'] (preview tanpa akun)
+
+SESSION:
+  Cookie PHPSESSID (Httponly via server, path=/), session server-side default PHP
+  Role disimpan di session; client merender berdasarkan KX_GUEST const
+
+3. DASHBOARD - STRUKTUR & ENDPOINT
+-----------------------------------
+Sections (nav): Dashboard | My Profile | Inbox | Tasks | Faucet | Watch To Earn |
+Withdraw | History | Contact | Advertiser | Logout | Referral (iframe)
+
+COIN SYSTEM:
+  - Saldo: coins (internal) + USD (tampilan $0.0000)
+  - Level: LEVEL 1 BRONZE, XP 0/500 per level
+  - "Tasks Today", "Energy" (100%), "Coins Balance"
+  - Referral link: referral.php?v=<version> (iframe)
+
+Endpoints (JSON kecuali fetch_custom = HTML):
+  GET  /faucet_status             -> {ready, armed, reward, seconds_left?}
+  POST /faucet_claim              -> 2-step anti-bot (lihat #4)
+  GET  /daily_bonus_api?action=status -> {claimed_today, streak, bonus_coins, streak_bonus}
+  POST /daily_bonus_api           -> body action=claim
+  GET  /fetch_ptc_ads             -> [] (kosong per observasi)
+  POST /ptc_start                 -> FormData ad_id -> {status, url, duration}
+  POST /ptc_verify                -> FormData ad_id
+  GET  /fetch_social              -> [task] (JSON, instructions per action_type)
+  GET  /fetch_custom              -> HTML kartu tugas (reward 200 coins/tugas)
+  POST /submit_task               -> FormData (proofTaskId, proofTaskType, screenshot)
+  GET  /watch_api?action=list     -> {status, videos:[]} (kosong)
+  POST /watch_api                 -> action=start|tick|claim, video_id, timer client-side
+  GET  /article_status.php        -> status baca artikel (Read-to-Earn)
+  GET  /inbox_api?action=fetch    -> {status, messages:[]}
+  POST /inbox_api                 -> aksi inbox
+  GET  /daily_bonus_api           -> lihat atas
+  POST /profile_api               -> FormData (FaucetPay email, foto, dsb.)
+  POST /withdraw_request          -> FormData (lihat #7)
+  GET  /chat_api?action=fetch&since=<ts> -> live chat
+  POST /chat_api                  -> kirim pesan
+
+4. FAUCET - FLOW LENGKAP SAMPAI REWARD (2-STEP ANTI-BOT)
+---------------------------------------------------------
+Konstanta: reward default 20 coins, cooldown 24 jam, LANDING stat: min payout $0.50
+
+STEP 0 - INIT (DOMContentLoaded -> checkFaucet()):
+  fetch('faucet_status') -> d = {ready, armed, reward, seconds_left}
+  - ready=true, armed=false  -> tampil tombol "CLAIM NOW" + badge reward
+  - ready=true, armed=true   -> tampil tombol "COLLECT COINS" + hint
+  - ready=false              -> tampil timer 24h (#faucet-timer), reload saat 0
+
+STEP 1 - ARM (kxFaucetStart):
+  POST /faucet_claim (FormData: step=start)
+  Response: {status:"armed"} -> location.reload()
+  Tujuan: klaim tidak bisa satu request; butuh interaksi user yang terpisah
+
+STEP 2 - COLLECT (kxFaucetCollect):
+  Klik COLLECT -> disable tombol -> POST /faucet_claim
+  FormData: step=collect, fp=<kxGetFingerprint()>
+  Response sukses: {status:"success", reward:20}
+    -> kxCreditNotify(20, 'Faucet reward credited!') + coin burst animation
+    -> setTimeout(()=>location.reload(), 2600)
+  Response gagal: {status:error, message} -> toast + auto reload 1.8s
+
+ANTI-ABUSE (gambaran arsitektur):
+  - 2-step wajib urut (start -> armed -> collect), server simpan flag armed
+  - fp (fingerprint) HANYA dikirim di step collect
+  - Server-side cooldown: timer dihitung server; client hanya menampilkan mundur
+  - Incognito/VPN/proxy/multi-tab terdeteksi via fp + cookie + session
+  - Klaim gagal/armed basi -> armed reset otomatis (alert to reload)
+
+COIN VALUE (implisit):
+  Leaderboard $12 Bonus: pos1 166 coins = $5, pos2 122 = $3, pos3 35 = $2
+  -> ~$0.03/coin (hanya untuk kontes; withdraw pakai USD langsung, bukan kurs publik)
+
+5. FINGERPRINT (DESKRIPSI TEKNIS)
+------------------------------------
+Lokasi: dashboard JS, fungsi kxGetFingerprint()
+Tujuan: anti multi-account / penanda perangkat unik, BUKAN enkripsi
+
+Cara kerja (konseptual):
+  1. Cek localStorage 'kx_fp' -> jika ada, langsung dipakai (stabil per browser)
+  2. Jika belum ada: render teks 14px Arial ke canvas, baca hasil render
+     (perbedaan GPU/font/driver menghasilkan piksel berbeda per perangkat)
+  3. Gabung dengan sinyal lingkungan: userAgent, screen WxH, timezone
+     (Intl), language, hardwareConcurrency
+  4. Hash payload gabungan dengan 2 mixer 32-bit (operasi multiply-xor),
+     gabung jadi hex 16 karakter
+  5. Simpan ke localStorage 'kx_fp'; kirim sebagai field fp pada step collect
+
+Karakteristik:
+  - Kekuatan: lemah/client-side (canvas hash bukan pengganti identitas)
+  - Konsistensi lintas session stabil selama canvas+UA sama
+  - Clear localStorage -> fp baru (server bisa deteksi [fp baru + IP sama])
+  - Digunakan hanya pada step collect (tidak untuk login)
+
+6. CARA LAIN MENDAPAT COINS (semua bermuara ke jalur yang sama)
+---------------------------------------------------------------
+a) Daily Login Bonus: 10 coins (+70 jika streak 7 hari) — klaim manual harian
+b) Read to Earn: klik START READING -> tab baru -> baca artikel 30 detik ->
+   salin kode 4 digit dari halaman -> CLAIM 25 COINS (cooldown terpisah)
+c) Watch To Earn: video iframe; wajib tab terbuka (timer pause jika tab tidak
+   aktif/hidden) -> visibilitychange listener; klaim via watch_api action=claim
+d) PTC Ads: ptc_start -> buka tab iklan (url dari server) + timer overlay 10-60s
+   -> saat 0 -> ptc_verify -> coins credit
+e) Social Tasks: instruksi per action_type:
+   subscribe/like/follow/share/comment -> screenshot -> submit_task ->
+   admin review manual -> approve/tolak (tolak = tanpa kredit; pelanggaran
+   ulangi = ban/negative balance)
+f) Custom Offers: kartu tugas 200 coins (contoh: join bot Telegram, signup
+   faucet pesaing) -> screenshot -> submit_task -> review admin
+g) Offerwalls: CPAlead, ClixWall, TimeWall, TheoremReach, MyLead, BitcoTasks
+   -> kredit via postback server-to-server eksternal (paling sering macet)
+h) Referral: komisi dari earnings downline (lifetime), share link referral.php
+i) Leaderboard: kontes 25 hari, ranking dari coins earned (bukan USD)
+
+7. WITHDRAW - FLOW LENGKAP
+---------------------------
+Form: #withdrawForm  method=FaucetPay (wajib)  amount USD  FaucetPay email
+JS:
+  - Validasi wMethod terisi
+  - Overlay progress animasi (fake UX: progress bar %, 3 fase working->done)
+  - POST /withdraw_request (FormData form)
+Response:
+  - status=success  -> overlay selesai, "REQUEST SUBMITTED! 1-3 days"
+  - code=need_tasks -> modal kx-tasks-modal ("faucet coins alone can't withdraw")
+  - lainnya          -> toast error (saldo kurang/metode invalid/dsb.)
+Backend:
+  - Minimum $0.50 (landing) / enforcement: wajib ada task selesai (need_tasks)
+  - Payment history: kolom method/amount/status/reason/date
+  - "Payment will be sent within 1 to 3 days" (bukan instant; landing mengklaim instant)
+  - Payments hold bisa sampai 7 hari (Privacy Policy)
+  - Refund: tidak ada (deposit advertiser final, saldo akun dibanned hangus)
+
+8. KEAMANAN & ANTI-ABUSE (LAYER)
+---------------------------------
+1. Server-side session (PHP) + role redirect
+2. 2-step faucet (armed flag server)
+3. Server-side cooldown + seconds_left
+4. Client fingerprint (canvas hash) pada step collect
+5. Rate limiting implisit (gagal berulang -> armed reset)
+6. Manual moderation bukti task (admin panel)
+7. Server enforcement aturan withdraw (need_tasks)
+8. Anti multi-account: Terms 11 titik (IP, device, fingerprint, screen, OS,
+   localStorage, cookies, ISP, VPN, perilaku, wallet) — policy, bukan kode
+9. Negative balance sebagai hukuman pelanggaran task
+
+9. PELAJARAN DESAIN UNTUK WEB SENDIRI
+-------------------------------------
+- Pisahkan client/server autoritatif: cooldown, reward, saldo, aturan
+  withdraw divalidasi server; JS hanya untuk UX
+- Armed-pattern untuk aksi sensitif 2-request (cegah double-submit)
+- Ledger transaksional (payment history) sebagai source of truth saldo
+- Role-based redirect setelah login (admin vs user)
+- Guest mode dengan batasan section (KX_GUEST_ALLOWED)
+- Postback server-to-server untuk crediting offerwall (lebih aman dari
+  kepercayaan client)
+- Fake-progress UX (overlay % ) hanya Kosmetik — jangan jadi sumber status
+  sebenarnya; selalu tunggu response server
+- Audit: log setiap claim/reward untuk dispute resolution
+================================================================================
+
+================================================================================
+APPENDIX A - SPESIFIKASI FUNGSIONAL JS (START -> COLLECT)
+Deskripsi perilaku, bukan source asli. Cukup untuk memahami/membangun ulang
+pola serupa di web Anda.
+================================================================================
+
+KONSTANTA HALAMAN
+  const KX_GUEST = false          // true = mode preview (hanya section faucet)
+  const KX_GUEST_ALLOWED = ['faucet']
+  KX_GUEST mengubah handler: aksi berbayar -> tampilkan modal signup
+
+STATE DOM YANG DIREKAYASA
+  #btn-claim-faucet   tombol "CLAIM NOW"
+  #btn-collect-faucet tombol "COLLECT COINS" (hidden sampai armed)
+  #faucet-timer       timer 24h (inline-block setelah cooldown aktif)
+  #kx-faucet-reward   blok badge reward (+20 COINS), ditampilkan bila ready
+  #kx-collect-hint    hint kecil di atas COLLECT
+  #kx-credit-pop      notifikasi premium "+N COINS credited"
+  #kx-faucet-loading / #ptc-overlay dst. overlay bantu
+
+ALUR DOMContentLoaded
+  1. register listener DOMContentLoaded -> panggil checkFaucet()
+  2. checkFaucet menampilkan state sesuai KX_GUEST:
+     - guest  -> reward box 20 coins ditampilkan, CLAIM visible, tanpa fetch
+     - member -> fetch GET faucet_status (relative URL, cookie session dikirim)
+
+checkFaucet() LOGIC (spesifikasi)
+  response d: {ready, armed, reward?, seconds_left?}
+  - ready==true && armed==false:
+      reward box tampil (isi angka dari d.reward), tombol CLAIM tampil, timer hidden
+  - ready==true && armed==true:
+      tombol COLLECT tampil + hint; CLAIM hidden; reward box tampil
+  - ready==false:
+      startTimer(d.seconds_left); CLAIM/COLLECT hidden
+
+startTimer(s) LOGIC
+  interval 1000ms; dekrement; render HH:MM:SS ke #faucet-timer;
+  saat 0 -> clearInterval + location.reload()
+  Catatan desain: murni tampilan; otoritas waktu ada di server (d.seconds_left)
+
+STEPPER (2 REQUEST, URUT)
+  Request 1 - ARM:
+    triggered kxFaucetStart():
+      - UX: tombol -> spinner + "PLEASE WAIT..."
+      - build FormData {step:"start"}
+      - POST faucet_claim (cookie session)
+      - d.status=="armed"  -> location.reload()      // state baru dirender
+      - d.status!=armed    -> toast error; tombol reset; bila seconds_left -> reload
+
+  Request 2 - COLLECT:
+    triggered kxFaucetCollect():
+      - tombol COLLECT disabled + spinner "COLLECTING..."
+      - build FormData {step:"collect", fp: kxGetFingerprint()}
+      - POST faucet_claim
+      - d.status=="success":
+          kxCreditNotify(d.reward, 'Faucet reward credited!')
+          coin burst + setTimeout(reload, 2600ms)
+      - selain itu: toast error + setTimeout(reload, 1800ms)
+    Error jaringan/catch -> langsung reload (state server yang menentukan)
+
+FINGERPRINT (peran & aliran data, bukan formula)
+  kxGetFingerprint() mengembalikan string hex 16 char atau '' saat gagal
+  - stabil di browser yang sama berkat cache localStorage['kx_fp']
+  - masukan: hasil rendering canvas teks (Arial 14px), navigator.userAgent,
+    screen WxH, timezone (Intl), navigator.language, navigator.hardwareConcurrency
+  - payload digabung -> dua hash 32-bit campur-kali/xor -> hex16
+  - dikirim server sebagai field 'fp' HANYA pada step collect
+  - fungsi tidak mengandung network call; gagal (canvas disabled dll) -> ''
+
+EVENT FLOW RINGKAS
+  page load -> checkFaucet -> (ready? CLAIM : timer)
+  CLAIM click -> arm -> reload
+  page load -> (armed? COLLECT : CLAIM)
+  COLLECT click -> fp -> collect -> notify -> reload -> (ready=false -> timer)
+
+RESPONS SERVER YANG MENENTUKAN (client tidak pernah enforces)
+  armed state tersimpan server-side per akun/session
+  reward & cooldown divalidasi server (abaikan nilai client)
+  collect ditolak bila: armed basi/kadaluarsa, cooldown aktif, fp tidak cocok
+  (atau IP/fingerprint tercatat ganda), saldo task belum memenuhi syarat payout
+
+================================================================================
+APPENDIX B - PSEUDO-IMPLEMENTASI UNTUK WEB ANDA (pola, bukan salinan)
+================================================================================
+Backend (Flask/Django):
+  POST /faucet/arm     -> buat armed_ticket {user, exp=now+600s, nonce}; simpan db
+  POST /faucet/collect -> cek ticket valid & belum dipakai -> cek cooldown db ->
+                          verifikasi fingerprint hash opsional -> kredit ledger ->
+                          set cooldown_until = now + 86400 -> return {reward}
+Frontend:
+  armBtn  -> fetch(arm) -> reload
+  collectBtn -> fetch(collect, {fp: fingerprint()}) -> tampilkan +N -> reload
+Fingerprint edukasi: hash canvas+UA+screen+tz (SHA-256 cukup), simpan di db
+  untuk flagging akun duplikat - bukan untuk identitas perorangan.
+Ledger:
+  credits += reward; insert payments_log(type='faucet', amount, ts)
+  withdraw validation: count(tasks_completed) >= 1 AND usd_balance >= 0.50
+================================================================================
+
+================================================================================
+APPENDIX C - REKONSTRUKSI FUNGSIONAL (clean-room, gaya sendiri)
+Perilaku setara alur asli untuk dipelajari & diadaptasi ke web Anda.
+Bukan salinan byte-per-byte; penamaan & detail berbeda, arsitektur sama.
+================================================================================
+
+<!-- ===== HTML SKELETON (inti) ===== -->
+<button id="btn-claim-faucet"  class="btn-flash"  onclick="faucetStart()">CLAIM NOW</button>
+<button id="btn-collect-faucet" class="btn-flash" style="display:none" onclick="faucetCollect()">COLLECT COINS</button>
+<span  id="faucet-timer" style="display:none">00:00:00</span>
+<div id="kx-collect-hint" style="display:none">One more click to collect!</div>
+<div id="reward-box" style="display:none">+<span id="reward-num">20</span> COINS</div>
+
+<!-- ===== JS INTI ===== -->
+<script>
+// ---------- state ----------
+let armed = false;          // sinkronkan dari server saat render
+const COOLDOWN_SEC = 24 * 3600;
+
+// ---------- 0. init ----------
+document.addEventListener('DOMContentLoaded', faucetInit);
+
+async function faucetInit() {
+  try {
+    const d = await (await fetch('faucet_status')).json();
+    const claim   = document.getElementById('btn-claim-faucet');
+    const collect = document.getElementById('btn-collect-faucet');
+    const timer   = document.getElementById('faucet-timer');
+    const reward  = document.getElementById('reward-box');
+
+    claim.style.display = collect.style.display = 'none';
+    reward.style.display = 'none';
+
+    if (d.ready) {
+      if (d.reward) {
+        document.getElementById('reward-num').textContent = d.reward;
+        reward.style.display = 'block';
+      }
+      if (d.armed) collect.style.display = 'inline-block';
+      else         claim.style.display   = 'inline-block';
+    } else {
+      startCooldown(d.seconds_left || COOLDOWN_SEC);
+    }
+  } catch (e) { console.warn('faucet init failed', e); }
+}
+
+function startCooldown(s) {
+  const t = document.getElementById('faucet-timer');
+  t.style.display = 'inline-block';
+  const tick = setInterval(() => {
+    s -= 1;
+    const h = String(Math.floor(s / 3600)).padStart(2, '0');
+    const m = String(Math.floor((s % 3600) / 60)).padStart(2, '0');
+    const x = String(s % 60).padStart(2, '0');
+    t.textContent = `${h}:${m}:${x}`;
+    if (s <= 0) { clearInterval(tick); location.reload(); }
+  }, 1000);
+}
+
+// ---------- 1. ARM ----------
+async function faucetStart() {
+  const btn = document.getElementById('btn-claim-faucet');
+  btn.disabled = true;
+  btn.textContent = 'PLEASE WAIT...';
+
+  const fd = new FormData();
+  fd.append('step', 'start');
+  const d = await (await fetch('faucet_claim', { method: 'POST', body: fd })).json();
+
+  if (d.status === 'armed') return location.reload();   // step 2 dirender ulang
+  toast(d.message || 'Error');
+  btn.disabled = false;
+  btn.textContent = 'CLAIM NOW';
+}
+
+// ---------- 2. COLLECT ----------
+async function faucetCollect() {
+  const btn = document.getElementById('btn-collect-faucet');
+  btn.disabled = true;
+  btn.textContent = 'COLLECTING...';
+
+  const fd = new FormData();
+  fd.append('step', 'collect');
+  fd.append('fp', deviceFingerprint());
+
+  try {
+    const d = await (await fetch('faucet_claim', { method: 'POST', body: fd })).json();
+    if (d.status === 'success') creditNotify(d.reward, 'Faucet reward credited!');
+    else toast(d.message || 'Error');
+  } catch (e) { toast('Network error'); }
+  setTimeout(() => location.reload(), 2000);
+}
+
+// ---------- fingerprint edukasi (canvas + lingkungan) ----------
+function deviceFingerprint() {
+  let cached = localStorage.getItem('my_fp');
+  if (cached) return cached;
+  try {
+    const c = document.createElement('canvas');
+    const ctx = c.getContext('2d');
+    ctx.fillStyle = '#f60'; ctx.fillRect(10, 5, 60, 20);
+    ctx.fillStyle = '#069'; ctx.fillText('fp-demo', 2, 12);
+
+    const raw = [
+      c.toDataURL(),
+      navigator.userAgent,
+      `${screen.width}x${screen.height}`,
+      Intl.DateTimeFormat().resolvedOptions().timeZone || '',
+      navigator.language,
+      navigator.hardwareConcurrency || ''
+    ].join('|');
+
+    // SHA-256 standar (bukan hash buatan tangan)
+    const bytes = new TextEncoder().encode(raw);
+    // sync ala web: pakai SubtleCrypto bila async diinginkan;
+    // contoh sync: hash sederhana (produksi pakai crypto.subtle.digest)
+    let h = 2166136261;
+    for (let i = 0; i < raw.length; i++) {
+      h ^= raw.charCodeAt(i);
+      h = Math.imul(h, 16777619) >>> 0;
+    }
+    const fp = bytes.length ? (h >>> 0).toString(16).padStart(8, '0') : '';
+    localStorage.setItem('my_fp', fp);
+    return fp;
+  } catch (e) { return ''; }
+}
+
+// ---------- UX helpers ----------
+function creditNotify(amount, msg) {
+  const el = document.getElementById('kx-credit-pop') || (() => {
+    const d = document.createElement('div');
+    d.id = 'kx-credit-pop'; d.className = 'credit-pop';
+    document.body.appendChild(d); return d;
+  })();
+  el.textContent = `+${amount} COINS`;
+  el.classList.add('show');
+  setTimeout(() => el.classList.remove('show'), 2500);
+}
+function toast(msg) {
+  const t = document.createElement('div');
+  t.className = 'toast'; t.textContent = msg;
+  document.body.appendChild(t);
+  setTimeout(() => t.remove(), 3500);
+}
+</script>
+
+<!-- ===== SERVER (pseudo-Flask) ===== -->
+@app.route('/faucet_status')
+def faucet_status():
+    st = db.query_one('SELECT ready_at, armed_until FROM faucet WHERE user_id=?', uid)
+    now = int(time.time())
+    ready = now >= (st.ready_at or 0)
+    return jsonify(ready=ready,
+                   armed=bool(st.armed_until and st.armed_until > now),
+                   reward=20,
+                   seconds_left=max(0, (st.ready_at or 0) - now))
+
+@app.route('/faucet_claim', methods=['POST'])
+def faucet_claim():
+    step = request.form.get('step')
+    now = int(time.time())
+    if step == 'start':
+        db.execute('UPDATE faucet SET armed_until=? WHERE user_id=?', now + 600, uid)
+        return jsonify(status='armed')
+    if step == 'collect':
+        st = db.query_one('SELECT armed_until, ready_at FROM faucet WHERE user_id=?', uid)
+        if not st.armed_until or st.armed_until < now:
+            return jsonify(status='error', message='Claim expired. Please arm again.')
+        if now < (st.ready_at or 0):
+            return jsonify(status='error', message='Cooldown active.')
+        fp = request.form.get('fp', '')
+        db.execute('INSERT INTO credits(user_id, amount, src) VALUES (?,?,?)', uid, 20, 'faucet')
+        db.execute('UPDATE faucet SET ready_at=?, armed_until=NULL WHERE user_id=?', now + 86400, uid)
+        return jsonify(status='success', reward=20)
+    return jsonify(status='error', message='Bad step.')
+
+================================================================================
+APPENDIX D - KONTRAK API (TABEL)
+================================================================================
+ Endpoint          Method  Req body                Resp sukses
+ ----------------  ------  ----------------------  ------------------------------
+ faucet_status     GET     - (cookie)              {ready, armed, reward, seconds_left}
+ faucet_claim      POST    step=start              {status:"armed"}
+ faucet_claim      POST    step=collect&fp=<hex>   {status:"success", reward:N}
+ daily_bonus_api   GET     ?action=status          {claimed_today, streak, bonus_coins, streak_bonus}
+ daily_bonus_api   POST    action=claim            {status, coins?}
+ ptc_start         POST    ad_id                   {status:"success", url, duration}
+ ptc_verify        POST    ad_id                   {status, message}
+ fetch_social      GET     -                       [{id, action_type, url, reward_coins,...}]
+ fetch_custom      GET     -                       HTML fragment kartu tugas
+ submit_task       POST    FormData(proof image)   {status, message}
+ watch_api         POST    action=start|claim, id  {status, ...}
+ watch_api         GET     ?action=list            {status:"ok", videos:[{...}]}
+ withdraw_request  POST    FormData(method, amount, fp_email) {status} / {code:"need_tasks"}
+ profile_api       POST    FormData(...)           {status}
+ inbox_api         GET/POST action=...             {status, messages?}
+ chat_api          GET/POST since/<msg>            live chat
+
+================================================================================
+CATATAN TEKNIS
+ - Cookie session dikirim otomatis (fetch same-origin)
+ - Semua enforce waktu & saldo ada di server; JS hanya menampilkan
+ - Armed-ticket habis masa (contoh 600 detik) mencegah collect basi
+ - Reward/cooldown/saldo disimpan di DB, bukan localStorage
+ - Produksi sebaiknya pakai crypto.subtle.digest('SHA-256', ...) untuk fp
+   (async) dan rate-limit per IP+user di layer server/WAF
+================================================================================

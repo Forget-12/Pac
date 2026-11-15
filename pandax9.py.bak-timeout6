@@ -1,0 +1,1671 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+PandaFaucet Auto Claim — Multi-Coin Dynamic (rotating by USD value) — MERGED solver
+
+Konsep:
+- Solver tetap pakai puppeteer-real-browser (Node child, tidak diubah 1:1)
+- Python spawn Node sekali, komunikasi stdin/stdout NDJSON (no HTTP, no polling)
+- 1 browser dipakai bersama, context di-recycle tiap task (RAM bersih)
+- Flow faucet / proxy / worker logic identik dengan pandax9.py lama
+"""
+
+import asyncio
+import re
+import os
+import sys
+import time
+import json
+import uuid
+import random
+import string
+from datetime import datetime
+
+from curl_cffi.requests import AsyncSession
+from colorama import init, Fore, Style
+
+init(autoreset=True, strip=False)   # jangan buang warna meski stdout di-redirect ke file log
+
+# =====================================================================
+# CONFIG — FAUCET (tidak berubah)
+# =====================================================================
+BASE_URL = "https://pandafaucet.com"
+FILE_EMAILS = "emailscrap.txt"
+DEFAULT_PASSWORD = "Aprilia1"
+MAX_WORKERS = 4
+DELAY_BETWEEN_ACCOUNTS = 1
+MAX_ATTEMPTS_PER_ACCOUNT = 5
+# Gagal berbasis PROXY (verify/auth/login non-JSON/CF page) TIDAK makan kuota
+# attempt — maks 30x beruntun per email, lalu email di-skip.
+MAX_PROXY_FAILS_PER_ACCOUNT = 15
+REFILLING_PAUSE_SEC = 300
+UNCERTAIN_PAUSE_SEC = 90
+
+# =====================================================================
+# CONFIG — DYNAMIC COIN ROTATION (sort by nilai USD reward)
+# =====================================================================
+AVAILABLE_COINS = ["doge", "usdt", "eth", "ltc", "bch", "dash", "trx", "bnb",
+                   "sol", "xrp", "ada", "ton"]
+COINGECKO_IDS = {
+    "doge": "dogecoin", "usdt": "tether", "eth": "ethereum", "ltc": "litecoin",
+    "bch": "bitcoin-cash", "dash": "dash", "trx": "tron", "bnb": "binancecoin",
+    "sol": "solana", "xrp": "ripple", "ada": "cardano", "ton": "the-open-network"
+}
+SORTED_COINS = []          # diisi oleh fetch_and_sort_coins() saat start
+_refilled_coins = {}       # GLOBAL: coin → expiry epoch (deteksi refilling lintas worker)
+                            # direset otomatis saat 1 batch email selesai (cek ulang)
+
+# =====================================================================
+# CONFIG — SOLVER (in-process Node child)
+# =====================================================================
+SOLVER_MAX_ACTIVE      = 2
+SOLVER_MAX_QUEUE       = 6
+SOLVER_TASK_TIMEOUT_MS = 120000     # sama dengan TASK_TIMEOUT di app.js
+SOLVER_RESPONSE_GRACE  = 30         # buffer di atas TASK_TIMEOUT (detik)
+SOLVER_START_TIMEOUT   = 30
+SOLVER_CHILD_FILE      = "_solver_worker.js"
+
+# =====================================================================
+# PROXY — STICKY SESSION (tidak berubah)
+# =====================================================================
+USE_SESSION_TEMPLATE = True
+
+PROXY_SESSION_TEMPLATE = (
+    "http://19cd190a3d8fe4a4-session-{sid}-ttl-600:f8806fc3799eca55@gate-us.vaultproxies.com:777"
+)
+SESSION_SID_LEN  = 10
+SESSION_LIFE_SEC = 6000
+
+PROXY_STATIC_LIST = [
+    "http://czcrypto-geo-id:Kampret789@gate-eu.vaultproxies.com:80",
+]
+
+# Proxy hasil proxy_finder.py — dimuat sebagai fallback saat file ada.
+# Toggle "skip proxy awal" utk percobaan: env PANDAX_SKIP_INITIAL_PROXY=1
+# ATAU buat file penanda `.skip_session_proxy` (paling tahan lintas proot):
+#   touch .skip_session_proxy   → session template dimatikan, pakai list static+found
+#   rm .skip_session_proxy      → kembali normal (sticky session)
+PROXY_FILE     = "proxies_found.txt"
+PROXY_FILE_MAX = 100
+SKIP_SESSION_PROXY = (os.environ.get("PANDAX_SKIP_INITIAL_PROXY") == "1"
+                      or os.path.exists(".skip_session_proxy"))
+
+
+def _load_proxy_file(path, limit):
+    out, seen = [], set()
+    try:
+        with open(path, encoding="utf-8") as pf:
+            for line in pf:
+                p = line.strip()
+                if not p or p.startswith("#"):
+                    continue
+                if not re.match(r"^(https?|socks5h?)://\S+$", p):
+                    continue
+                if p in seen:
+                    continue
+                seen.add(p)
+                out.append(p)
+                if len(out) >= limit:
+                    break
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        print(f"[PROXY] Gagal baca {path}: {e}")
+    return out
+
+
+_file_proxies = _load_proxy_file(PROXY_FILE, PROXY_FILE_MAX)
+if _file_proxies:
+    if SKIP_SESSION_PROXY:
+        # Mode percobaan: proxy awal (session template + static bawaan) dilewati,
+        # hanya proxy hasil finder yang dipakai.
+        PROXY_STATIC_LIST = list(_file_proxies)
+        print(f"[PROXY] SKIP proxy awal aktif — hanya {len(_file_proxies)} proxy hasil finder dipakai")
+    else:
+        PROXY_STATIC_LIST = list(dict.fromkeys(PROXY_STATIC_LIST + _file_proxies))
+        print(f"[PROXY] {len(_file_proxies)} proxy dari {PROXY_FILE} ditambahkan ke fallback list")
+
+VPN_BLOCK_COOLDOWN = 180
+PROXY_VERIFY_TIMEOUT = 3.0   # proxy bugar merespons 0.6-0.9s; proxy mati harus cepat gagal
+
+_proxy_lock  = asyncio.Lock()
+_proxy_index = 0
+_last_proxy  = None
+_vpn_blocked = {}
+_refilling_until = 0
+_global_proxy_fails = 0
+AUTO_REFILL_FAIL_THRESHOLD = 40
+TOR_ONLY = True       # True = abaikan proxy publik: auto-refill/finder dinonaktifkan, hanya proxy dari proxies_found.txt (Tor)
+
+_uncertain_until = 0
+
+
+# =====================================================================
+# NODE CHILD — embedded source (app.js + turnstile.js, tanpa Express)
+# =====================================================================
+SOLVER_CHILD_JS = r'''
+
+
+// _solver_worker.js — Solver child process for pandax9.py
+// 1x browser (di-recycle saat idle), context.close() tiap task → RAM tidak menumpuk.
+// Protokol NDJSON stdin/stdout identik dengan versi sebelumnya.
+const { connect } = require("puppeteer-real-browser");
+const fs = require("fs");
+const path = require("path");
+const readline = require("readline");
+
+const MAX_ACTIVE       = parseInt(process.env.MAX_ACTIVE, 10)    || 1;
+const MAX_QUEUE        = parseInt(process.env.MAX_QUEUE, 10)     || 6;
+const TASK_TIMEOUT     = parseInt(process.env.TASK_TIMEOUT, 10)  || 120000;
+const CHROME_PATH      = process.env.CHROME_PATH || "/usr/bin/chromium";
+const IDLE_RECYCLE_MS  = parseInt(process.env.BROWSER_IDLE_RECYCLE_MS || "600000", 10); // 0 = nonaktif
+const RECYCLE_EVERY_TASKS = parseInt(process.env.RECYCLE_EVERY_TASKS || "10", 10);  // recycle Chromium tiap N task; 0 = nonaktif
+const BLOCK_SUBRES     = process.env.BLOCK_SUBRESOURCES !== "0"; // blok image/media/font (hemat RAM+bandwidth)
+const TMP_MAX_AGE_MS   = 3600 * 1000; // folder sisa lebih muda dari 1 jam dibiarkan (bisa milik proses lain)
+
+let browser = null;
+let browserStarting = null;
+let browserAlive = false;
+let browserGen = 0;
+let activeTasks = 0;
+let tasksDone = 0;
+let pendingRecycle = false;
+let shuttingDown = false;
+let idleTimer = null;
+const queue = [];
+const running = new Map(); // id -> { page, context, signal }
+
+function send(obj) {
+    process.stdout.write(JSON.stringify(obj) + "\n");
+}
+function logMsg(msg) {
+    process.stderr.write(msg + "\n");
+}
+
+process.on("unhandledRejection", (e) => {
+    logMsg("[FATAL] unhandledRejection: " + (e && (e.stack || e.message) || String(e)));
+});
+
+// ---------- validasi target (anti SSRF / navigasi ke jaringan internal) ----------
+function blockedHost(hostname) {
+    const h = String(hostname || "").toLowerCase();
+    if (!h) return true;
+    if (h === "localhost" || h.endsWith(".local") || h.endsWith(".internal") || h === "metadata.google.internal") return true;
+    const m = h.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+    if (m) {
+        const a = +m[1], b = +m[2];
+        if (a === 0 || a === 10 || a === 127) return true;
+        if (a === 169 && b === 254) return true;      // link-local + cloud metadata
+        if (a === 192 && b === 168) return true;
+        if (a === 172 && b >= 16 && b <= 31) return true;
+    }
+    if (h === "::1" || h.startsWith("fe80:") || h.startsWith("fc") || h.startsWith("fd") || h.startsWith("[::")) return true;
+    return false;
+}
+function validateDomain(domain) {
+    let u;
+    try { u = new URL(domain); } catch { return null; }
+    if (u.protocol !== "https:" && u.protocol !== "http:") return null;
+    if (blockedHost(u.hostname)) return null;
+    return u;
+}
+
+// ---------- browser lifecycle (idle recycle → bebaskan RAM baseline) ----------
+function scheduleIdleRecycle() {
+    if (!IDLE_RECYCLE_MS) return;
+    clearTimeout(idleTimer);
+    idleTimer = setTimeout(async () => {
+        if (activeTasks === 0 && queue.length === 0 && browser) {
+            logMsg("[BROWSER] Idle — recycle Chromium (hemat RAM).");
+            const b = browser;
+            browser = null;
+            browserAlive = false;
+            browserGen++;
+            try { await b.close(); } catch (e) { logMsg("[BROWSER] close: " + (e && e.message)); }
+        }
+    }, IDLE_RECYCLE_MS);
+    idleTimer.unref?.();
+}
+
+async function launchBrowser() {
+    logMsg("[BROWSER] Meluncurkan Chromium...");
+    const gen = ++browserGen;
+    const started = connect({
+        headless: false,
+        turnstile: true,
+        customConfig: {
+            chromePath: CHROME_PATH,
+            args: [
+                '--no-sandbox',
+                '--disable-gpu',
+                '--disable-dev-shm-usage',
+                '--js-flags=--max-old-space-size=512',
+                '--disable-background-networking',
+                '--disable-backgrounding-occluded-windows',
+                '--disable-renderer-backgrounding',
+                '--disable-component-update',
+                '--disable-default-apps',
+                '--disable-extensions',
+                '--disable-sync',
+                '--disable-breakpad',
+                '--no-first-run',
+                '--no-default-browser-check',
+                '--mute-audio',
+                '--disk-cache-size=10485760'
+            ]
+        }
+    }).then(ctx => {
+        if (gen !== browserGen) { // sudah di-recycle/diganti sebelum connect selesai
+            try { ctx.browser.close(); } catch {}
+            throw new Error("launch superseded");
+        }
+        browser = ctx.browser;
+        browserAlive = true;
+        logMsg("[BROWSER] Chromium berhasil diluncurkan!");
+        browser.on("disconnected", () => {
+            if (gen !== browserGen) return; // event dari generasi lama
+            logMsg("[BROWSER] Chromium putus koneksi — akan diluncurkan ulang saat task berikutnya.");
+            browser = null;
+            browserAlive = false;
+            for (const entry of running.values()) entry.signal.aborted = true;
+        });
+        return browser;
+    }).catch(err => {
+        throw new Error("Launch failed: " + err.message);
+    });
+    return started;
+}
+
+async function init_browser() {
+    if (!browser || !browserAlive) {
+        if (!browserStarting) {
+            browserStarting = launchBrowser()
+                .catch(err => { throw err; })
+                .finally(() => { browserStarting = null; });
+        }
+        await browserStarting;
+    }
+    const context = await browser.createBrowserContext();
+    const page = await context.newPage();
+    page.setDefaultNavigationTimeout(TASK_TIMEOUT);
+    page.setDefaultTimeout(TASK_TIMEOUT);
+    return { page, context };
+}
+
+// -------- turnstile.js logic (dioptimalkan) --------
+async function turnstile({ domain, siteKey, action, cdata, pagedata }, page, signal) {
+    const timeout = TASK_TIMEOUT;
+    const startTime = Date.now();
+    let targetHost = domain;
+    try { targetHost = new URL(domain).hostname; } catch (e) {}
+
+    // JSON.stringify → kebal terhadap kutip/</script> di nilai cdata/pagedata
+    const esc = (v) => JSON.stringify(String(v == null ? "" : v));
+
+    const htmlContent = `
+            <!DOCTYPE html>
+            <html lang="en">
+            <head>
+                <meta charset="utf-8">
+                <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                <title>Verification</title>
+                <style>
+                    body {
+                        margin: 0; padding: 0; display: flex; justify-content: center; align-items: center; height: 100vh; background-color: #f9f9f9;
+                        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+                    }
+                    #cf-container { margin: auto; }
+                </style>
+            </head>
+            <body>
+                <div id="cf-container" class="cf-turnstile"></div>
+                <script>
+                    window.__cfError = null;
+                    window.__cfToken = null;
+                    window.onloadTurnstileCallback = function () {
+                        try {
+                            turnstile.render('#cf-container', {
+                                sitekey: ${esc(siteKey)},
+                                ${action ? `action: ${esc(action)},` : ""}
+                                ${cdata ? `cData: ${esc(cdata)},` : ""}
+                                ${pagedata ? `chlPageData: ${esc(pagedata)},` : ""}
+                                callback: function (token) {
+                                    window.__cfToken = token;
+                                    var c = document.createElement('input');
+                                    c.type = 'hidden';
+                                    c.name = 'cf-response';
+                                    c.value = token;
+                                    document.body.appendChild(c);
+                                },
+                                'error-callback': function(code) {
+                                    window.__cfError = code;
+                                },
+                                'expired-callback': function() {
+                                    window.__cfToken = null;
+                                }
+                            });
+                        } catch(e) {
+                            window.__cfError = 'render_err: ' + e.message;
+                        }
+                    };
+                </script>
+                <script src="https://challenges.cloudflare.com/turnstile/v0/api.js?onload=onloadTurnstileCallback" defer></script>
+            </body>
+            </html>
+        `;
+
+    await page.setRequestInterception(true);
+
+    let intercepted = false;
+    const onRequest = async (request) => {
+        try {
+            const rt = request.resourceType();
+            // Hemat RAM/bandwidth: widget tidak butuh gambar/media/font
+            if (BLOCK_SUBRES && (rt === "image" || rt === "media" || rt === "font")) {
+                await request.abort();
+                return;
+            }
+            if (!intercepted && request.isNavigationRequest() && request.frame() === page.mainFrame()) {
+                try {
+                    await request.respond({
+                        status: 200,
+                        contentType: "text/html",
+                        body: htmlContent
+                    });
+                    intercepted = true; // hanya set setelah respond sukses
+                } catch (e) {
+                    logMsg("[ts] Intercept respond gagal: " + (e && e.message));
+                }
+                return;
+            }
+            await request.continue();
+        } catch (e) {
+            logMsg("[ts] request handler: " + (e && e.message));
+        }
+    };
+    page.on("request", onRequest);
+
+    try {
+        logMsg(`[ts] Navigasi ke: ${domain}`);
+        // Gagal navigasi = error instan (bukan tunggu 120 detik polling)
+        await page.goto(domain, { waitUntil: "domcontentloaded", timeout });
+
+        let lastLogSec = -1;
+        let nextClickAt = Date.now() + 3000 + Math.random() * 2000;
+        let interval = 800; // backoff 800ms → 2000ms
+
+        while (Date.now() - startTime < timeout) {
+            if (signal.aborted) throw new Error("cancelled");
+
+            const token = await page.evaluate(() => {
+                return window.__cfToken ||
+                       document.querySelector('[name="cf-response"]')?.value ||
+                       document.querySelector('input[name="cf-turnstile-response"]')?.value;
+            }).catch(() => null);
+
+            if (token && token.length > 10) {
+                logMsg(`[ts] Token didapat (${token.length} chars)`);
+                return { token, type: "turnstile" };
+            }
+
+            const errCode = await page.evaluate(() => window.__cfError).catch(() => null);
+            if (errCode) {
+                if (String(errCode).includes('300030')) {
+                    throw new Error(`Invalid Sitekey (300030) untuk domain ${targetHost}`);
+                }
+                if (String(errCode).includes('600010')) {
+                    throw new Error(`Bot detected (600010)`);
+                }
+                throw new Error(`Widget error code: ${errCode}`);
+            }
+
+            const elapsed = Math.floor((Date.now() - startTime) / 1000);
+            if (elapsed % 5 === 0 && elapsed > 0 && elapsed !== lastLogSec) {
+                lastLogSec = elapsed;
+                logMsg(`[ts] Menunggu token... (${elapsed}s)`);
+            }
+
+            // Klik checkbox widget — posisi & interval di-jitter (anti pola bot)
+            if (elapsed >= 3 && Date.now() >= nextClickAt) {
+                try {
+                    const iframes = await page.$$('iframe');
+                    for (const frameElement of iframes) {
+                        const src = await frameElement.evaluate(el => el.src).catch(() => "");
+                        if (src.includes("challenges.cloudflare.com")) {
+                            const box = await frameElement.boundingBox().catch(() => null);
+                            if (box && box.width > 0 && box.height > 0) {
+                                const cx = box.x + box.width * (0.3 + Math.random() * 0.4);
+                                const cy = box.y + box.height * (0.3 + Math.random() * 0.4);
+                                await page.mouse.move(cx, cy, { steps: 4 + Math.floor(Math.random() * 5) }).catch(() => {});
+                                await page.mouse.down().catch(() => {});
+                                await new Promise(r => setTimeout(r, 40 + Math.random() * 120));
+                                await page.mouse.up().catch(() => {});
+                                nextClickAt = Date.now() + 3000 + Math.random() * 4000;
+                            }
+                        }
+                    }
+                } catch (e) {
+                    logMsg("[ts] klik widget: " + (e && e.message));
+                }
+            }
+
+            await new Promise(r => setTimeout(r, interval));
+            interval = Math.min(interval + 150, 2000);
+        }
+        throw new Error("timeout error");
+    } finally {
+        // puppeteer EventEmitter: nama method bisa `off` atau `removeListener` — coba keduanya
+        try {
+            if (typeof page.off === "function") page.off("request", onRequest);
+            else if (typeof page.removeListener === "function") page.removeListener("request", onRequest);
+        } catch (e) { logMsg("[ts] removeListener: " + (e && e.message)); }
+        try { await page.setRequestInterception(false); } catch (e) { logMsg("[ts] disable interception: " + (e && e.message)); }
+    }
+}
+
+async function executeTask(item) {
+    let ctx = null;
+    const signal = { aborted: false };
+    try {
+        ctx = await init_browser();
+        running.set(item.id, { page: ctx.page, context: ctx.context, signal });
+        const result = await turnstile(item.data, ctx.page, signal);
+        send({ id: item.id, status: "ready", token: result.token });
+    } catch (err) {
+        send({ id: item.id, status: "error", err: err.message || String(err) });
+    } finally {
+        running.delete(item.id);
+        if (ctx) {
+            try { if (ctx.page) await ctx.page.close().catch(() => {}); } catch (e) { logMsg("[Task] close page: " + (e && e.message)); }
+            try { if (ctx.context) await ctx.context.close().catch(() => {}); } catch (e) { logMsg("[Task] close context: " + (e && e.message)); }
+            logMsg(`[Task ${item.id}] Context dibersihkan.`);
+        }
+        activeTasks--;
+        tasksDone++;
+        if (RECYCLE_EVERY_TASKS && tasksDone % RECYCLE_EVERY_TASKS === 0) pendingRecycle = true;
+        if (pendingRecycle && activeTasks === 0 && browser) {
+            pendingRecycle = false;
+            logMsg(`[BROWSER] Recycle berkala tiap ${RECYCLE_EVERY_TASKS} task (total=${tasksDone}) — hemat RAM`);
+            const b = browser;
+            browser = null; browserAlive = false; browserGen++;
+            try { await b.close(); } catch (e) { logMsg("[BROWSER] close: " + (e && e.message)); }
+        } else if (activeTasks === 0) {
+            scheduleIdleRecycle();
+        }
+        setImmediate(processQueue);
+    }
+}
+
+function processQueue() {
+    if (shuttingDown) return;
+    clearTimeout(idleTimer);
+    while (activeTasks < MAX_ACTIVE && queue.length > 0) {
+        const item = queue.shift();
+        activeTasks++;
+        executeTask(item); // .finally digantikan di dalam executeTask
+    }
+}
+
+// Storage cleanup — hanya folder milik sendiri & lebih tua dari TMP_MAX_AGE_MS
+setInterval(() => {
+    try {
+        const targets = ["/tmp", "/root/.cache"];
+        let removed = 0;
+        const now = Date.now();
+        for (const dir of targets) {
+            if (!fs.existsSync(dir)) continue;
+            for (const entry of fs.readdirSync(dir)) {
+                if (!(entry.startsWith("puppeteer_dev_") || entry.startsWith(".org.chromium.Chromium"))) continue;
+                try {
+                    const full = path.join(dir, entry);
+                    const st = fs.statSync(full);
+                    if (now - st.mtimeMs < TMP_MAX_AGE_MS) continue; // masih mungkin dipakai
+                    fs.rmSync(full, { recursive: true, force: true });
+                    removed++;
+                } catch (e) {}
+            }
+        }
+        if (removed > 0) logMsg(`[CLEANUP] ${removed} folder sisa dibersihkan.`);
+    } catch (e) { logMsg("[CLEANUP] " + (e && e.message)); }
+}, 300000).unref?.();
+
+// stdin reader — NDJSON
+const rl = readline.createInterface({ input: process.stdin });
+rl.on("line", async (line) => {
+    let msg;
+    try { msg = JSON.parse(line); } catch { return; }
+
+    // ---- cancel: dari queue ATAU yang sedang berjalan (force-close context) ----
+    if (msg.cancel) {
+        const id = String(msg.cancel).replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 64);
+        const idx = queue.findIndex(x => x.id === id);
+        if (idx >= 0) {
+            queue.splice(idx, 1);
+            logMsg(`[Task ${id}] Dihapus dari queue.`);
+            return;
+        }
+        const entry = running.get(id);
+        if (entry) {
+            entry.signal.aborted = true;
+            try { await entry.page.close({ runBeforeUnload: false }); } catch (e) {}
+            try { await entry.context.close(); } catch (e) {}
+            logMsg(`[Task ${id}] Dibatalkan paksa — context ditutup, RAM dibebaskan.`);
+        }
+        return;
+    }
+
+    const id = String(msg.id == null ? "" : msg.id).replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 64);
+    if (!id || !msg.sitekey) {
+        send({ id: id || "?", status: "error", err: "BAD_PARAMETERS" });
+        return;
+    }
+    if (shuttingDown) {
+        send({ id, status: "error", err: "SHUTTING_DOWN" });
+        return;
+    }
+    if (queue.length >= MAX_QUEUE) {
+        send({ id, status: "error", err: "QUEUE_FULL" });
+        return;
+    }
+    // ---- SSRF guard: URL valid, scheme http(s), bukan host internal/private ----
+    const target = validateDomain(String(msg.domain || ""));
+    if (!target) {
+        send({ id, status: "error", err: "BAD_DOMAIN" });
+        return;
+    }
+    queue.push({
+        id,
+        data: {
+            domain: String(msg.domain),
+            siteKey: String(msg.sitekey),
+            action: msg.action == null ? null : String(msg.action),
+            cdata: msg.cdata == null ? null : String(msg.cdata),
+            pagedata: msg.pagedata == null ? null : String(msg.pagedata)
+        }
+    });
+    processQueue();
+});
+
+// ---------- graceful shutdown: tolak task baru, tunggu yang berjalan, baru close ----------
+let shutdownStarted = false;
+async function shutdown(reason) {
+    if (shutdownStarted) return;
+    shutdownStarted = true;
+    shuttingDown = true;
+    logMsg(`[SHUTDOWN] ${reason} — menolak task baru, menunggu ${activeTasks} task aktif (maks 8s)...`);
+    const deadline = Date.now() + 8000;
+    while (activeTasks > 0 && Date.now() < deadline) {
+        await new Promise(r => setTimeout(r, 100));
+    }
+    for (const entry of running.values()) {
+        entry.signal.aborted = true;
+        try { await entry.context.close(); } catch (e) {}
+    }
+    const b = browser;
+    browser = null;
+    browserAlive = false;
+    browserGen++;
+    if (b) { try { await b.close(); } catch (e) {} }
+    process.exit(0);
+}
+rl.on("close", () => shutdown("stdin ditutup (parent exit?)")); // parent crash → child ikut mati, Chromium tidak yatim
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));
+
+send({ event: "ready" });
+'''
+
+
+# =====================================================================
+# SOLVER CHILD (Python side) — spawn node, NDJSON request/response
+# =====================================================================
+class SolverChild:
+    def __init__(self):
+        self._proc = None
+        self._pending = {}    # task_id -> Future
+        self._reader_task = None
+        self._stderr_task = None
+        self._ready = asyncio.Event()
+        self._response_timeout = (SOLVER_TASK_TIMEOUT_MS / 1000.0) + SOLVER_RESPONSE_GRACE
+
+    async def start(self):
+        base = os.path.dirname(os.path.abspath(__file__))
+        js_path = os.path.join(base, SOLVER_CHILD_FILE)
+        with open(js_path, "w", encoding="utf-8") as f:
+            f.write(SOLVER_CHILD_JS)
+
+        env = os.environ.copy()
+        env["MAX_ACTIVE"]    = str(SOLVER_MAX_ACTIVE)
+        env["MAX_QUEUE"]     = str(SOLVER_MAX_QUEUE)
+        env["TASK_TIMEOUT"]  = str(SOLVER_TASK_TIMEOUT_MS)
+
+        self._proc = await asyncio.create_subprocess_exec(
+            "node", js_path,
+            cwd=base,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=env,
+        )
+        self._reader_task = asyncio.create_task(self._reader())
+        self._stderr_task = asyncio.create_task(self._stderr_reader())
+        try:
+            await asyncio.wait_for(self._ready.wait(), timeout=SOLVER_START_TIMEOUT)
+        except asyncio.TimeoutError:
+            raise RuntimeError(f"Solver child gagal start dalam {SOLVER_START_TIMEOUT}s")
+        log(None, None, "SOLVER",
+            f"Child ready (MAX_ACTIVE={SOLVER_MAX_ACTIVE}, MAX_QUEUE={SOLVER_MAX_QUEUE})")
+
+    async def _stderr_reader(self):
+        while True:
+            line = await self._proc.stderr.readline()
+            if not line:
+                return
+            try:
+                text = line.decode("utf-8", errors="replace").rstrip()
+            except Exception:
+                continue
+            if text:
+                log(None, None, "SOLVER", text)
+
+    async def _reader(self):
+        while True:
+            line = await self._proc.stdout.readline()
+            if not line:
+                for fut in self._pending.values():
+                    if not fut.done():
+                        fut.set_exception(RuntimeError("solver child exited"))
+                self._pending.clear()
+                return
+            try:
+                msg = json.loads(line.decode())
+            except Exception:
+                continue
+
+            if msg.get("event") == "ready":
+                self._ready.set()
+                continue
+
+            task_id = msg.get("id")
+            fut = self._pending.pop(task_id, None)
+            if not fut or fut.done():
+                continue
+            if msg.get("status") == "ready":
+                fut.set_result(msg.get("token"))
+            else:
+                fut.set_exception(RuntimeError(msg.get("err", "unknown")))
+
+    async def request_token(self, domain, sitekey, action=None, cdata=None, pagedata=None):
+        if not self._proc or self._proc.returncode is not None:
+            raise RuntimeError("solver child dead")
+
+        task_id = uuid.uuid4().hex[:12]
+        fut = asyncio.get_running_loop().create_future()
+        self._pending[task_id] = fut
+
+        payload = {
+            "id": task_id,
+            "domain": domain,
+            "sitekey": sitekey,
+            "action": action,
+            "cdata": cdata,
+            "pagedata": pagedata,
+        }
+        try:
+            self._proc.stdin.write((json.dumps(payload) + "\n").encode())
+            await self._proc.stdin.drain()
+        except Exception as e:
+            self._pending.pop(task_id, None)
+            raise RuntimeError(f"stdin write failed: {e}")
+
+        try:
+            return await asyncio.wait_for(fut, timeout=self._response_timeout)
+        except asyncio.TimeoutError:
+            # beri tahu child untuk cancel kalau masih di queue
+            try:
+                self._proc.stdin.write((json.dumps({"cancel": task_id}) + "\n").encode())
+                await self._proc.stdin.drain()
+            except Exception:
+                pass
+            self._pending.pop(task_id, None)
+            raise
+
+    async def stop(self):
+        if self._proc and self._proc.returncode is None:
+            try:
+                self._proc.terminate()
+                await asyncio.wait_for(self._proc.wait(), timeout=5)
+            except (asyncio.TimeoutError, ProcessLookupError):
+                try: self._proc.kill()
+                except Exception: pass
+        for t in (self._reader_task, self._stderr_task):
+            if t and not t.done():
+                t.cancel()
+
+
+SOLVER = SolverChild()
+
+
+# =====================================================================
+# LOG (identik dengan pandax9.py lama)
+# =====================================================================
+_LOG_STYLE = {
+    "SUCCESS": ("✓",  Fore.GREEN + Style.BRIGHT,        Fore.GREEN + Style.BRIGHT),
+    "ERROR":   ("✗",  Fore.RED + Style.BRIGHT,          Fore.RED + Style.BRIGHT),
+    "FATAL":   ("✗",  Fore.RED + Style.BRIGHT,          Fore.RED + Style.BRIGHT),
+    "WAIT":    ("⏳", Fore.YELLOW,                     Fore.YELLOW),
+    "PROXY":   ("⇆",  Fore.MAGENTA,                    Fore.MAGENTA),
+    "PROXYOK": ("✓",  Fore.GREEN,                      Fore.GREEN),
+    "SKIP":    ("⊘",  Fore.LIGHTBLACK_EX,              Fore.LIGHTBLACK_EX),
+    "SOLVER":  ("✦",  Fore.LIGHTCYAN_EX,               Fore.LIGHTCYAN_EX),
+    "POLL":    ("↺",  Fore.CYAN,                       Fore.CYAN),
+    "STEP":    ("→",  Fore.LIGHTGREEN_EX,              Fore.WHITE + Style.BRIGHT),
+    "TIMING":  ("◷",  Fore.LIGHTYELLOW_EX,             Fore.LIGHTYELLOW_EX),
+    "RETRY":   ("↻",  Fore.YELLOW + Style.BRIGHT,      Fore.YELLOW + Style.BRIGHT),
+    "NET":     ("⇄",  Fore.LIGHTBLUE_EX,               Fore.LIGHTBLUE_EX),
+    "COIN":    ("◈",  Fore.LIGHTMAGENTA_EX,            Fore.LIGHTMAGENTA_EX),
+    "BLOCKED": ("⊘",  Fore.LIGHTBLACK_EX,              Fore.LIGHTBLACK_EX),
+    "CRASH":   ("✗",  Fore.RED + Style.BRIGHT,         Fore.RED + Style.BRIGHT),
+}
+
+def log(worker_id, email, status, msg):
+    ts = datetime.now().strftime("%H:%M:%S")
+    short_email = (email[:12] + "…") if email else "system"
+    w_id = f"W{worker_id}" if worker_id else "SYS"
+    icon, tag_color, msg_color = _LOG_STYLE.get(status, ("•", Fore.WHITE, Fore.WHITE))
+    dim = Style.DIM + Fore.LIGHTBLACK_EX
+    print(f"{dim}{ts}{Style.RESET_ALL} {tag_color}{icon} {status:<7}{Style.RESET_ALL} "
+          f"{Fore.BLUE + Style.BRIGHT}{w_id:<3}{Style.RESET_ALL} "
+          f"{dim}{short_email:<14}{Style.RESET_ALL}"
+          f" {dim}│{Style.RESET_ALL} {msg_color}{msg}{Style.RESET_ALL}",
+          flush=True)
+
+
+# =====================================================================
+# DYNAMIC COIN REWARD SCRAPER — sort by nilai USD reward
+# =====================================================================
+async def fetch_and_sort_coins():
+    global SORTED_COINS
+    log(None, None, "BOT", "Menganalisis halaman /faucet-coins & harga pasar crypto...")
+
+    try:
+        r = None
+        for attempt in (1, 2):
+            try:
+                async with AsyncSession(impersonate="chrome110", verify=False,
+                                        timeout=20.0) as sess:
+                    r = await sess.get(f"{BASE_URL}/faucet-coins")
+                break
+            except Exception as e:
+                log(None, None, "WAIT",
+                    f"Analisa faucet-coins gagal (percobaan {attempt}/2): {str(e)[:60]}")
+                if attempt == 1:
+                    await asyncio.sleep(3)
+        if r is None:
+            raise Exception("faucet-coins tidak bisa dijangkau (2x percobaan gagal)")
+
+        html = r.text
+        coin_raw_rewards = {}
+
+        # Strategi 1: href="claim-xxx" ... <span class="gv">nilai</span>
+        pattern = r'href="claim-([a-z]+)"[^>]*>.*?<span class="gv">([0-9.]+)'
+        for coin, val_str in re.findall(pattern, html, re.DOTALL):
+            if coin in AVAILABLE_COINS:
+                try:
+                    val = float(val_str)
+                    if coin not in coin_raw_rewards or val > coin_raw_rewards[coin]:
+                        coin_raw_rewards[coin] = val
+                except ValueError:
+                    pass
+
+        # Strategi 2 (fallback): "<angka> <COIN>"
+        if not coin_raw_rewards:
+            coins_pattern = "|".join(c.upper() for c in AVAILABLE_COINS)
+            pattern2 = r'([0-9]+\.[0-9]+)[^A-Za-z0-9]*(' + coins_pattern + r')\b'
+            for val_str, coin_str in re.findall(pattern2, html):
+                coin = coin_str.lower()
+                try:
+                    val = float(val_str)
+                    if coin not in coin_raw_rewards or val > coin_raw_rewards[coin]:
+                        coin_raw_rewards[coin] = val
+                except ValueError:
+                    pass
+
+        if not coin_raw_rewards:
+            raise Exception("Gagal mendeteksi angka reward")
+
+        # Harga USD dari CoinGecko (tanpa proxy — API publik)
+        cg_ids = ",".join(COINGECKO_IDS[c] for c in coin_raw_rewards if c in COINGECKO_IDS)
+        prices = {}
+        try:
+            async with AsyncSession(impersonate="chrome110", verify=False,
+                                    timeout=10.0) as cg:
+                cg_url = (f"https://api.coingecko.com/api/v3/simple/price"
+                          f"?ids={cg_ids}&vs_currencies=usd")
+                resp = await cg.get(cg_url)
+                if resp.status_code == 200:
+                    prices = resp.json()
+        except Exception as e:
+            log(None, None, "ERROR", f"Gagal ambil harga CoinGecko: {str(e)[:40]}")
+
+        coin_usd_values = {}
+        for coin, raw_val in coin_raw_rewards.items():
+            cg_id = COINGECKO_IDS.get(coin)
+            usd_price = prices.get(cg_id, {}).get("usd", 0) if cg_id else 0
+            if not prices:
+                usd_price = 1.0   # CoinGecko gagal → pakai raw reward sebagai proxy
+            coin_usd_values[coin] = raw_val * usd_price
+
+        SORTED_COINS = sorted(coin_usd_values, key=lambda k: coin_usd_values[k],
+                              reverse=True)
+        log_str = ", ".join(f"{c.upper()}(${coin_usd_values[c]:.6f})" for c in SORTED_COINS)
+        log(None, None, "COIN", f"Urutan Coin (USD): {log_str}")
+
+    except Exception as e:
+        log(None, None, "ERROR", f"Gagal total proses analisa: {str(e)[:50]}")
+        if SORTED_COINS:
+            log(None, None, "COIN",
+                f"Pertahankan urutan sebelumnya "
+                f"({', '.join(c.upper() for c in SORTED_COINS)}) — harga tidak terbaca, bukan bug fatal")
+        else:
+            log(None, None, "COIN", "Menggunakan urutan default.")
+            SORTED_COINS = list(AVAILABLE_COINS)
+
+
+# =====================================================================
+# PROXY HELPERS (identik)
+# =====================================================================
+def _proxy_label(proxy_url):
+    try:
+        cred = proxy_url.split("://", 1)[1].split("@", 1)[0]
+        user = cred.split(":", 1)[0]
+        m = re.search(r"-sess-([a-z0-9]+)", user)
+        if m:
+            return f"sess-{m.group(1)[-6:]}"
+        return user[-8:] if len(user) > 8 else user
+    except Exception:
+        return "proxy"
+
+
+def _is_proxy_error(e):
+    m = str(e).lower()
+    return any(x in m for x in [
+        "connect tunnel", "connect failed", "connection refused",
+        "failed to perform", "couldn't connect", "could not resolve",
+        "network is unreachable", "connection reset", "timed out",
+        "curl: (5)", "curl: (6)", "curl: (7)", "curl: (28)",
+        "curl: (35)", "curl: (52)", "curl: (56)",
+    ])
+
+
+def block_proxy(proxy_url):
+    global _global_proxy_fails
+    _vpn_blocked[proxy_url] = time.time() + VPN_BLOCK_COOLDOWN
+    _global_proxy_fails += 1
+
+
+def _random_sid():
+    return "".join(random.choices(string.ascii_lowercase + string.digits, k=SESSION_SID_LEN))
+
+
+_finder_lock = asyncio.Lock()
+_last_finder_run = 0.0
+FINDER_MIN_INTERVAL = 300     # detik — maks 1x auto-refill per 5 menit
+FINDER_TIMEOUT      = 240     # batas atas subprocess finder (detik)
+
+
+async def _auto_register_fresh_proxies(worker_id=None, email=None):
+    """Semua proxy mati/diblok → jalankan proxy_finder.py & gabungkan hasilnya."""
+    global PROXY_STATIC_LIST, _last_finder_run
+    if TOR_ONLY:
+        return False
+    if time.time() - _last_finder_run < FINDER_MIN_INTERVAL:
+        return False
+    async with _finder_lock:
+        if time.time() - _last_finder_run < FINDER_MIN_INTERVAL:
+            return False
+        _last_finder_run = time.time()
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "proxy_finder.py")
+        log(worker_id, email, "PROXY",
+            "Semua proxy mati → jalankan proxy_finder.py (auto-refill)...")
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                sys.executable, script,
+                "--target", "pandafaucet.com",
+                "--per-source", "200", "--max", "60",
+                "--concurrency", "60", "--timeout", "8",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT)
+            out, _ = await asyncio.wait_for(proc.communicate(),
+                                            timeout=FINDER_TIMEOUT)
+            tail = out.decode("utf-8", "ignore").strip().splitlines()
+            for line in tail[-3:]:
+                log(worker_id, email, "PROXY", f"finder: {line}")
+        except Exception as e:
+            log(worker_id, email, "ERROR",
+                f"proxy_finder gagal: {str(e)[:80]}")
+            return False
+        fresh = _load_proxy_file(PROXY_FILE, PROXY_FILE_MAX)
+        if not fresh:
+            log(worker_id, email, "PROXY", "auto-refill: tidak ada proxy hidup ditemukan")
+            return False
+        # utamakan proxy fresh (belum diblok) sebelum sisa list lama
+        merged = [p for p in fresh if p not in _vpn_blocked]
+        merged += [p for p in PROXY_STATIC_LIST if p not in merged]
+        PROXY_STATIC_LIST = merged
+        log(worker_id, email, "PROXY",
+            f"auto-refill sukses: {len(merged)} proxy tersedia")
+        return True
+
+
+async def get_new_proxy(worker_id=None, email=None):
+    global _proxy_index, _last_proxy, _global_proxy_fails
+
+    if USE_SESSION_TEMPLATE and not SKIP_SESSION_PROXY:
+        sid = _random_sid()
+        proxy = PROXY_SESSION_TEMPLATE.format(sid=sid)
+        return proxy, f"sess-{sid[-6:]}"
+
+    while True:
+        # refill proaktif: setelah N kegagalan proxy beruntun (global, lintas worker),
+        # ganti modal proxy segar tanpa menunggu seluruh pool masuk blok
+        if _global_proxy_fails >= AUTO_REFILL_FAIL_THRESHOLD:
+            _global_proxy_fails = 0
+            if await _auto_register_fresh_proxies(worker_id, email):
+                continue
+        need_refill = False
+        async with _proxy_lock:
+            now = time.time()
+            for p in list(_vpn_blocked.keys()):
+                if now >= _vpn_blocked[p]:
+                    del _vpn_blocked[p]
+            n = len(PROXY_STATIC_LIST)
+            if n == 0:
+                need_refill = True
+                wait_sec = 15
+            else:
+                idx = _proxy_index
+                pick = None
+                # pass 1: prefer proxy unblocked DAN berbeda dari siklus sebelumnya
+                for _ in range(n):
+                    p = PROXY_STATIC_LIST[idx % n]
+                    idx += 1
+                    if p not in _vpn_blocked and p != _last_proxy:
+                        pick = p
+                        break
+                # pass 2 (fallback): proxy unblocked apa pun — tetap beda index
+                if pick is None:
+                    for _ in range(n):
+                        p = PROXY_STATIC_LIST[idx % n]
+                        idx += 1
+                        if p not in _vpn_blocked:
+                            pick = p
+                            break
+                if pick is not None:
+                    _proxy_index = idx
+                    _last_proxy = pick
+                    return pick, _proxy_label(pick)
+                need_refill = True   # semua entri sedang diblok
+                if _vpn_blocked:
+                    wait_sec = max(1, int(min(_vpn_blocked.values()) - now))
+                else:
+                    wait_sec = 15
+
+        if need_refill and await _auto_register_fresh_proxies(worker_id, email):
+            continue   # ada proxy fresh → langsung coba lagi, tanpa menunggu
+        if worker_id:
+            log(worker_id, email, "WAIT", f"Semua static proxy blocked, tunggu {wait_sec}s")
+        await asyncio.sleep(wait_sec + 1)
+
+
+async def verify_proxy_target(worker_id, email, proxy_url):
+    proxies = {"http": proxy_url, "https": proxy_url}
+    session = AsyncSession(impersonate="chrome110", proxies=proxies,
+                           timeout=PROXY_VERIFY_TIMEOUT, verify=False)
+    try:
+        try:
+            r = await session.get(f"{BASE_URL}/")
+        except Exception as e:
+            return False, str(e)[:60]
+        if r.status_code in (200, 301, 302):
+            return True, f"HTTP {r.status_code}"
+        return False, f"HTTP {r.status_code} (suspected block)"
+    finally:
+        await session.close()
+
+
+# =====================================================================
+# UTILS (identik)
+# =====================================================================
+def _extract(text, pattern, default=None):
+    m = re.search(pattern, text)
+    return m.group(1) if m else default
+
+
+def needs_restart(resp):
+    if not resp: return False
+    for key in ("restart_claim", "fresh_claim_required"):
+        if resp.get(key): return True
+    fc = resp.get("flowCheck") or {}
+    for key in ("restart_claim", "fresh_claim_required"):
+        if fc.get(key): return True
+    return False
+
+
+def _quota_limited(resp):
+    """pf_api mengirim globalQuota / ipQuota / emailQuota (dipaksa server,
+    tidak bisa dibypass). Kembalikan info limit jika harian habis."""
+    if not isinstance(resp, dict):
+        return None
+    def _num(v):
+        try:
+            return int(float(v or 0))
+        except (TypeError, ValueError):
+            return 0
+    for key, scope in (("globalQuota", "global"),
+                       ("ipQuota", "ip"),
+                       ("emailQuota", "email")):
+        q = resp.get(key)
+        if isinstance(q, dict) and q.get("limited"):
+            return {"scope": scope, "used": _num(q.get("used")),
+                    "limit": _num(q.get("limit")), "retry": _num(q.get("retryAfter"))}
+    return None
+
+
+CF_CHALLENGE_MARKERS = (
+    "just a moment", "cf-challenge", "attention required",
+    "challenges.cloudflare.com",
+)
+
+
+def _validate_claim_page(r_text, sitekey, flow_id):
+    if not r_text or not sitekey or not flow_id:
+        return False, "missing sitekey/flow"
+    head = r_text[:3000].lower()
+    if any(m in head for m in CF_CHALLENGE_MARKERS):
+        return False, "cloudflare challenge"
+    if not sitekey.startswith("0x"):
+        return False, f"sitekey format invalid ({sitekey[:10]}…)"
+    return True, "ok"
+
+
+# =====================================================================
+# SOLVE_TURNSTILE — drop-in wrapper (perilaku identik, tapi 0ms overhead)
+# =====================================================================
+async def solve_turnstile(worker_id, email, pageurl, sitekey, action=None, cdata=None):
+    if not sitekey:
+        return None
+    try:
+        token = await SOLVER.request_token(
+            domain=pageurl, sitekey=sitekey, action=action, cdata=cdata,
+        )
+        if token:
+            log(worker_id, email, "SOLVER",
+                f"Token OK (len={len(token)}) action={action}")
+        return token
+    except asyncio.TimeoutError:
+        log(worker_id, email, "ERROR",
+            f"Solver deadline {int(SOLVER_TASK_TIMEOUT_MS/1000)}s — abort")
+        return None
+    except Exception as e:
+        msg = str(e)
+        if "QUEUE_FULL" in msg:
+            backoff = random.uniform(5, 10)
+            log(worker_id, email, "WAIT",
+                f"Solver QUEUE_FULL → backoff {backoff:.1f}s")
+            await asyncio.sleep(backoff)
+        else:
+            log(worker_id, email, "ERROR", f"Solver: {msg[:80]}")
+        return None
+
+
+# =====================================================================
+# API helper — request ke pandafaucet via session (proxy aktif)
+# =====================================================================
+async def api_post(session, coin, action, payload, referer):
+    url = f"{BASE_URL}/pf_api?coin={coin}&action={action}"
+    headers = {"Origin": BASE_URL, "Referer": referer, "Content-Type": "application/json"}
+    try:
+        r = await session.post(url, json=payload, headers=headers)
+        return r.json()
+    except Exception:
+        return None
+
+
+# =====================================================================
+# ONE ATTEMPT — identik dengan pandax9.py lama
+# =====================================================================
+async def run_attempt(worker_id, email, attempt_num, coin):
+    global _refilling_until, _uncertain_until, _global_proxy_fails
+    coin_upper = coin.upper()
+
+    if time.time() < _refilling_until:
+        log(worker_id, email, "SKIP", f"refilling pause {int(_refilling_until - time.time())}s")
+        return "skip"
+    if time.time() < _uncertain_until:
+        remain = int(_uncertain_until - time.time())
+        log(worker_id, email, "SKIP", f"cooldown pasca-uncertain {remain}s")
+        return "skip"
+
+    proxy_url, proxy_label = await get_new_proxy(worker_id, email)
+    if not proxy_url:
+        log(worker_id, email, "FATAL", "Tidak ada proxy tersedia")
+        return "skip"
+
+    log(worker_id, email, "PROXY", f"Attempt {attempt_num} | {coin_upper} | sticky: {proxy_label}")
+
+    ok, info = await verify_proxy_target(worker_id, email, proxy_url)
+    if not ok:
+        log(worker_id, email, "PROXY", f"Target tidak bisa diakses: {info} → rotasi")
+        if not USE_SESSION_TEMPLATE or SKIP_SESSION_PROXY:
+            block_proxy(proxy_url)
+        return "retry_proxy"
+    log(worker_id, email, "PROXYOK", f"Proxy sehat ({info})")
+
+    proxies = {"http": proxy_url, "https": proxy_url}
+    session = AsyncSession(impersonate="chrome110", proxies=proxies,
+                           timeout=60.0, verify=False)
+    t_cycle = time.time()
+
+    try:
+        try:
+            await session.post(f"{BASE_URL}/auth_init",
+                               json={"email": email, "password": DEFAULT_PASSWORD})
+            lr = await session.post(f"{BASE_URL}/auth_login",
+                                    json={"email": email, "password": DEFAULT_PASSWORD})
+        except Exception as e:
+            if _is_proxy_error(e):
+                log(worker_id, email, "PROXY", f"Auth proxy error: {str(e)[:50]}")
+                if not USE_SESSION_TEMPLATE or SKIP_SESSION_PROXY:
+                    block_proxy(proxy_url)
+                return "retry_proxy"
+            log(worker_id, email, "ERROR", f"Auth error: {str(e)[:50]}")
+            return "retry"
+
+        try:
+            login_status = lr.json().get("status")
+        except Exception:
+            login_status = None
+            body_head = lr.text[:600].lower()
+            if any(m in body_head for m in CF_CHALLENGE_MARKERS):
+                log(worker_id, email, "PROXY",
+                    f"Login diblok Cloudflare (HTTP {lr.status_code}) → rotasi")
+                if not USE_SESSION_TEMPLATE or SKIP_SESSION_PROXY:
+                    block_proxy(proxy_url)
+                return "retry_proxy"
+            if lr.headers.get("content-type", "").startswith("text/html"):
+                log(worker_id, email, "PROXY",
+                    f"Login HTML (HTTP {lr.status_code}) → dugaan proxy block")
+                if not USE_SESSION_TEMPLATE or SKIP_SESSION_PROXY:
+                    block_proxy(proxy_url)
+                return "retry_proxy"
+            log(worker_id, email, "PROXY",
+                f"Login non-JSON (dugaan proxy/CF): {lr.text[:40]} → rotasi")
+            if not USE_SESSION_TEMPLATE or SKIP_SESSION_PROXY:
+                block_proxy(proxy_url)
+            return "retry_proxy"
+
+        if login_status != "success":
+            log(worker_id, email, "ERROR", f"Gagal Login: {lr.text[:60]}")
+            return "retry"
+
+        claim_url = f"{BASE_URL}/claim-{coin}"
+
+        r1 = await session.get(claim_url)
+        flow1    = _extract(r1.text, r'const FLOW_ID="([0-9a-f]{64})"')
+        sitekey1 = _extract(r1.text, r'data-sitekey="([^"]+)"')
+        action1  = _extract(r1.text, r'data-action="([^"]+)"', "pf_claim_start")
+        raw_cdata1 = _extract(r1.text, r'data-cdata="([^"]+)"', None)
+        if raw_cdata1 is None:
+            log(worker_id, email, "WAIT", "⚠️ data-cdata tidak ada → fallback flow1")
+        cdata1 = raw_cdata1 or flow1
+        wait1  = int(_extract(r1.text, r'const CFG_WAIT1\s*=\s*(\d+);', "7"))
+
+        if not flow1 or not sitekey1:
+            log(worker_id, email, "PROXY",
+                "Parse claim page gagal (dugaan CF/proxy) → rotasi")
+            if not USE_SESSION_TEMPLATE or SKIP_SESSION_PROXY:
+                block_proxy(proxy_url)
+            return "retry_proxy"
+
+        ok_page, reason = _validate_claim_page(r1.text, sitekey1, flow1)
+        if not ok_page:
+            if reason == "cloudflare challenge":
+                log(worker_id, email, "PROXY", f"Claim page invalid: {reason} → rotasi")
+                if not USE_SESSION_TEMPLATE or SKIP_SESSION_PROXY:
+                    block_proxy(proxy_url)
+                return "retry_proxy"
+            log(worker_id, email, "RETRY", f"Claim page invalid: {reason} → rotasi")
+            return "retry"
+
+        st = await api_post(session, coin, "status",
+                            {"email": email, "flow_id": flow1,
+                             "flow_check": "start", "flow_only": True},
+                            claim_url)
+        if st:
+            ql = _quota_limited(st)
+            if ql:
+                if ql["scope"] == "global":
+                    log(worker_id, email, "SKIP",
+                        f"⛔ Kuota GLOBAL 24h habis ({ql['used']}/{ql['limit']}) → skip email")
+                    return "skip"
+                log(worker_id, email, "COIN",
+                    f"⛔ Kuota {ql['scope']} {coin_upper} habis ({ql['used']}/{ql['limit']}) → coba coin lain")
+                return "quota_switch"
+            if st.get("blocked"):
+                log(worker_id, email, "SKIP", f"blocked: {str(st.get('error',''))[:40]}")
+                return "skip"
+            if st.get("secondsLeft", 0) > 0:
+                log(worker_id, email, "SKIP", f"cooldown {st['secondsLeft']}s")
+                return "skip"
+            if st.get("refilling"):
+                log(worker_id, email, "COIN", f"{coin_upper} refilling → switch coin")
+                return "switch_coin"
+            if needs_restart(st):
+                log(worker_id, email, "RETRY", "status: restart_claim")
+                return "retry"
+            fc = st.get("flowCheck") or {}
+            if fc.get("ok"):
+                log(worker_id, email, "STEP", f"flow_only OK ({fc.get('secondsLeft','?')}s left)")
+
+        flow_deadline = time.time() + wait1
+
+        ts1 = await solve_turnstile(worker_id, email, claim_url, sitekey1,
+                                    action=action1, cdata=cdata1)
+        if not ts1:
+            return "retry"
+
+        remaining = max(0.0, flow_deadline - time.time())
+        if remaining > 0:
+            await asyncio.sleep(remaining + 0.3)
+
+        start_res = await api_post(session, coin, "start",
+                                   {"email": email, "flow_id": flow1,
+                                    "turnstile_token": ts1},
+                                   claim_url)
+
+        if not start_res:
+            return "retry"
+        ql = _quota_limited(start_res)
+        if ql:
+            if ql["scope"] == "global":
+                log(worker_id, email, "SKIP",
+                    f"⛔ Kuota GLOBAL 24h habis ({ql['used']}/{ql['limit']}) → skip email")
+                return "skip"
+            log(worker_id, email, "COIN",
+                f"⛔ Kuota {ql['scope']} {coin_upper} habis ({ql['used']}/{ql['limit']}) → coba coin lain")
+            return "quota_switch"
+        if start_res.get("blocked"):
+            log(worker_id, email, "SKIP", f"start blocked: {str(start_res.get('error',''))[:40]}")
+            return "skip"
+        if start_res.get("refilling"):
+            log(worker_id, email, "COIN", f"Start: {coin_upper} refilling → switch coin")
+            return "switch_coin"
+        if needs_restart(start_res):
+            log(worker_id, email, "RETRY", "start: restart_claim")
+            return "retry"
+        if not start_res.get("ok"):
+            log(worker_id, email, "RETRY", f"Start ditolak: {str(start_res)[:80]}")
+            return "retry"
+
+        claim_token = start_res.get("token")
+        wait2 = start_res.get("waitSeconds", 20)
+        t_start_ok = time.time()
+        log(worker_id, email, "STEP", f"Start OK! Tunggu {wait2}s...")
+
+        final_url = f"{BASE_URL}/final-claim-{coin}?flow={flow1}"
+        fr = await session.get(final_url)
+        final_flow    = _extract(fr.text, r'const FLOW_ID="([0-9a-f]{64})"', flow1)
+        final_sitekey = _extract(fr.text, r'data-sitekey="([^"]+)"', sitekey1)
+        final_action  = _extract(fr.text, r"action:'(pf_claim_[a-z]+)'", "pf_claim_payout")
+        raw_final_cdata = _extract(fr.text, r'data-flow="([^"]+)"', None)
+        if raw_final_cdata is None:
+            log(worker_id, email, "WAIT", "⚠️ data-flow tidak ada → fallback flow1")
+        final_cdata = raw_final_cdata or flow1
+
+        ok_page, reason = _validate_claim_page(fr.text, final_sitekey, final_flow)
+        if not ok_page:
+            if reason == "cloudflare challenge":
+                log(worker_id, email, "PROXY", f"Final page invalid: {reason} → rotasi")
+                if not USE_SESSION_TEMPLATE or SKIP_SESSION_PROXY:
+                    block_proxy(proxy_url)
+                return "retry_proxy"
+            log(worker_id, email, "RETRY", f"Final page invalid: {reason} → rotasi")
+            return "retry"
+
+        pre = await api_post(session, coin, "status",
+                             {"email": email, "flow_id": final_flow,
+                              "flow_check": "claim", "flow_only": True},
+                             final_url)
+        if pre:
+            ql = _quota_limited(pre)
+            if ql:
+                if ql["scope"] == "global":
+                    log(worker_id, email, "SKIP",
+                        f"⛔ Kuota GLOBAL 24h habis ({ql['used']}/{ql['limit']}) → skip email")
+                    return "skip"
+                log(worker_id, email, "COIN",
+                    f"⛔ Kuota {ql['scope']} {coin_upper} habis ({ql['used']}/{ql['limit']}) → coba coin lain")
+                return "quota_switch"
+            if pre.get("blocked"):
+                log(worker_id, email, "SKIP", f"preflight blocked: {str(pre.get('error',''))[:40]}")
+                return "skip"
+            if pre.get("refilling"):
+                log(worker_id, email, "COIN", f"Preflight: {coin_upper} refilling → switch coin")
+                return "switch_coin"
+            if needs_restart(pre):
+                log(worker_id, email, "RETRY", "preflight: restart_claim")
+                return "retry"
+            fc = pre.get("flowCheck") or {}
+            if not fc.get("ok"):
+                log(worker_id, email, "RETRY", "preflight: flowCheck not ok")
+                return "retry"
+
+        # Solver #2 — paralel dengan sleep(wait2)
+        solve_task = asyncio.create_task(solve_turnstile(
+            worker_id, email, final_url, final_sitekey,
+            action=final_action, cdata=final_cdata
+        ))
+        await asyncio.sleep(wait2)
+        ts2 = await solve_task
+        if not ts2:
+            return "retry"
+
+        elapsed = time.time() - t_start_ok
+        solver_extra = max(0.0, elapsed - wait2)
+        log(worker_id, email, "TIMING",
+            f"Elapsed since start: {elapsed:.1f}s "
+            f"(wait2={wait2}s, solver_extra={solver_extra:.1f}s)")
+
+        claim_payload = {"token": claim_token, "email": email,
+                         "turnstile_token": ts2, "flow_id": final_flow}
+        cr = await api_post(session, coin, "claim", claim_payload, final_url)
+
+        if cr:
+            ql = _quota_limited(cr)
+            if ql:
+                if ql["scope"] == "global":
+                    log(worker_id, email, "SKIP",
+                        f"⛔ Kuota GLOBAL 24h habis ({ql['used']}/{ql['limit']}) → skip email")
+                    return "skip"
+                log(worker_id, email, "COIN",
+                    f"⛔ Kuota {ql['scope']} {coin_upper} habis ({ql['used']}/{ql['limit']}) → coba coin lain")
+                return "quota_switch"
+            if cr.get("ad_rule_hold") is True:
+                log(worker_id, email, "SKIP",
+                    "ad_rule_hold: iklan wajib — skip (bukan error proxy)")
+                return "skip"
+            err_msg = str(cr.get("error", "") or "").lower()
+            if "uncertain" in err_msg:
+                _uncertain_until = time.time() + UNCERTAIN_PAUSE_SEC
+                log(worker_id, email, "SKIP",
+                    f"FaucetPay uncertain → SKIP, cooldown global {UNCERTAIN_PAUSE_SEC}s")
+                return "skip"
+
+        if cr and cr.get("cooldown"):
+            log(worker_id, email, "SKIP",
+                f"FaucetPay cooldown {cr.get('secondsLeft', '?')}s — lanjut email lain")
+            return "skip"
+        if cr and cr.get("ok"):
+            log(worker_id, email, "SUCCESS",
+                f"✅ BERHASIL! {cr.get('amountCoin')} {coin_upper} "
+                f"(total {time.time()-t_cycle:.0f}s)")
+            return "success"
+        if cr and cr.get("refilling"):
+            log(worker_id, email, "COIN", f"Claim: {coin_upper} refilling → switch coin")
+            return "switch_coin"
+        if cr and cr.get("blocked"):
+            log(worker_id, email, "SKIP", f"claim blocked: {str(cr.get('error',''))[:40]}")
+            return "skip"
+        if needs_restart(cr):
+            log(worker_id, email, "RETRY", f"claim restart_claim ({elapsed:.1f}s)")
+            return "retry"
+        if cr is None:
+            log(worker_id, email, "PROXY",
+                "Claim response bukan JSON (dugaan proxy/CF block)")
+            if not USE_SESSION_TEMPLATE or SKIP_SESSION_PROXY:
+                block_proxy(proxy_url)
+            return "retry_proxy"
+
+        log(worker_id, email, "RETRY", f"Claim Gagal: {str(cr)[:80]}")
+        return "retry"
+
+    except Exception as e:
+        if _is_proxy_error(e):
+            log(worker_id, email, "PROXY", f"Proxy error: {str(e)[:50]}")
+            if not USE_SESSION_TEMPLATE or SKIP_SESSION_PROXY:
+                block_proxy(proxy_url)
+            return "retry_proxy"
+        log(worker_id, email, "ERROR", f"Crash: {str(e)[:50]}")
+        return "retry"
+    finally:
+        await session.close()
+
+
+# =====================================================================
+# REFILL BLACKLIST (global, TTL)
+# =====================================================================
+def _coin_refilling_active(coin):
+    exp = _refilled_coins.get(coin)
+    if exp is None:
+        return False
+    if time.time() >= exp:
+        _refilled_coins.pop(coin, None)
+        return False
+    return True
+
+
+def _next_active_coin_index(start):
+    """Index coin berikutnya yang TIDAK refilling; None jika semua refilling."""
+    n = len(SORTED_COINS)
+    for k in range(n):
+        idx = (start + k) % n
+        if not _coin_refilling_active(SORTED_COINS[idx]):
+            return idx
+    return None
+
+
+# =====================================================================
+# ACCOUNT PROCESS
+# =====================================================================
+async def process_single_account(worker_id, email):
+    global _refilling_until
+    if not SORTED_COINS:
+        SORTED_COINS.extend(AVAILABLE_COINS)
+
+    attempt = 1
+    coin_index = 0
+    proxy_fails = 0
+    quota_switches = 0
+
+    while attempt <= MAX_ATTEMPTS_PER_ACCOUNT:
+        if time.time() < _refilling_until:
+            log(worker_id, email, "SKIP", "refilling pause (skip account)")
+            return False
+        if time.time() < _uncertain_until:
+            remain = int(_uncertain_until - time.time())
+            log(worker_id, email, "SKIP", f"cooldown pasca-uncertain {remain}s (skip account)")
+            return False
+
+        active_idx = _next_active_coin_index(coin_index)
+        if active_idx is None:
+            log(worker_id, email, "COIN",
+                f"Semua coin refilling! Pause global {REFILLING_PAUSE_SEC}s...")
+            _refilling_until = time.time() + REFILLING_PAUSE_SEC
+            return False
+        if active_idx != coin_index:
+            coin_index = active_idx
+        current_coin = SORTED_COINS[coin_index]
+        result = await run_attempt(worker_id, email, attempt, current_coin)
+
+        if result == "success":
+            return True
+        if result == "skip":
+            return False
+
+        if result == "retry_proxy":
+            proxy_fails += 1
+            if proxy_fails >= MAX_PROXY_FAILS_PER_ACCOUNT:
+                log(worker_id, email, "ERROR",
+                    f"{proxy_fails}x proxy gagal beruntun — skip email ini")
+                return False
+            log(worker_id, email, "PROXY",
+                f"Retry proxy #{proxy_fails}/{MAX_PROXY_FAILS_PER_ACCOUNT} "
+                f"(kuota attempt utuh)")
+            await asyncio.sleep(1)
+            continue
+
+        proxy_fails = 0
+
+        if result == "quota_switch":
+            quota_switches += 1
+            if quota_switches > len(SORTED_COINS):
+                log(worker_id, email, "ERROR",
+                    "Semua coin terkena limit kuota — skip email ini")
+                return False
+            next_idx = _next_active_coin_index((coin_index + 1) % len(SORTED_COINS))
+            if next_idx is None:
+                log(worker_id, email, "COIN",
+                    f"Semua coin refilling! Pause global {REFILLING_PAUSE_SEC}s...")
+                _refilling_until = time.time() + REFILLING_PAUSE_SEC
+                return False
+            coin_index = next_idx
+            log(worker_id, email, "RETRY",
+                f"Ganti ke coin {SORTED_COINS[coin_index].upper()} "
+                f"(kuota limit #{quota_switches}, attempt tidak berkurang)")
+            await asyncio.sleep(1)
+            continue
+
+        if result == "switch_coin":
+            _refilled_coins[current_coin] = time.time() + REFILLING_PAUSE_SEC
+            log(worker_id, email, "COIN",
+                f"{current_coin.upper()} diblacklist refill global "
+                f"({REFILLING_PAUSE_SEC}s) — berlaku untuk semua worker/email")
+            next_idx = _next_active_coin_index((coin_index + 1) % len(SORTED_COINS))
+            if next_idx is None:
+                log(worker_id, email, "COIN",
+                    f"Semua coin refilling! Pause global {REFILLING_PAUSE_SEC}s...")
+                _refilling_until = time.time() + REFILLING_PAUSE_SEC
+                return False
+
+            coin_index = next_idx
+            log(worker_id, email, "RETRY",
+                f"Ganti ke coin {SORTED_COINS[coin_index].upper()} (attempt tidak berkurang)")
+            await asyncio.sleep(1)
+            continue
+
+        if attempt < MAX_ATTEMPTS_PER_ACCOUNT:
+            log(worker_id, email, "RETRY",
+                f"Retry {attempt+1}/{MAX_ATTEMPTS_PER_ACCOUNT} — sticky sid baru + siklus baru")
+            await asyncio.sleep(2)
+        else:
+            log(worker_id, email, "ERROR",
+                f"Habis {MAX_ATTEMPTS_PER_ACCOUNT} attempt, skip email ini")
+        attempt += 1
+    return False
+
+
+# =====================================================================
+# WORKER
+# =====================================================================
+async def worker(worker_id, email_list):
+    total = len(email_list)
+    if total == 0:
+        log(worker_id, None, "SKIP", "chunk kosong (email < worker count)")
+        return
+
+    log(worker_id, None, "BOT", f"Chunk assigned: {total} email")
+
+    for idx, email in enumerate(email_list):
+        if time.time() < _refilling_until:
+            remaining = total - idx
+            log(worker_id, email, "SKIP",
+                f"refilling pause {int(_refilling_until - time.time())}s — "
+                f"berhenti, {remaining} email sisa di chunk")
+            return
+        if time.time() < _uncertain_until:
+            remaining = total - idx
+            log(worker_id, email, "SKIP",
+                f"cooldown pasca-uncertain {int(_uncertain_until - time.time())}s — "
+                f"berhenti, {remaining} email sisa di chunk")
+            return
+
+        await process_single_account(worker_id, email)
+
+        if idx < total - 1:
+            await asyncio.sleep(DELAY_BETWEEN_ACCOUNTS)
+
+    log(worker_id, None, "BOT", f"Chunk selesai ({total} email diproses)")
+
+
+# =====================================================================
+# MAIN
+# =====================================================================
+async def main():
+    print()
+    print(f"{Fore.CYAN}{Style.BRIGHT}{'═' * 58}{Style.RESET_ALL}")
+    print(f"{Fore.CYAN}{Style.BRIGHT}  ✦  PANDAFAUCET MULTI-COIN — MERGED SOLVER{Style.RESET_ALL}")
+    print(f"{Fore.CYAN}{Style.BRIGHT}{'═' * 58}{Style.RESET_ALL}")
+    log(None, None, "BOT", f"Coins          : dinamis, sort USD ({', '.join(c.upper() for c in AVAILABLE_COINS)})")
+    if _file_proxies:
+        log(None, None, "BOT", f"Proxy file     : {len(_file_proxies)} dimuat dari {PROXY_FILE} (fallback)")
+    if SKIP_SESSION_PROXY:
+        log(None, None, "BOT", "Proxy awal     : DILEWATI (skip session template) — memakai static/found list")
+    else:
+        log(None, None, "BOT", f"Proxy mode     : {'sticky session' if USE_SESSION_TEMPLATE else 'static list'}")
+    log(None, None, "BOT", f"Solver         : in-process Node child (puppeteer-real-browser)")
+    log(None, None, "BOT", f"  ↳ transport  : stdin/stdout NDJSON (no HTTP, no polling)")
+    log(None, None, "BOT", f"  ↳ MAX_ACTIVE : {SOLVER_MAX_ACTIVE}")
+    log(None, None, "BOT", f"  ↳ MAX_QUEUE  : {SOLVER_MAX_QUEUE}")
+    log(None, None, "BOT", f"  ↳ TASK_TMO   : {SOLVER_TASK_TIMEOUT_MS}ms")
+    log(None, None, "BOT", f"Max attempts   : {MAX_ATTEMPTS_PER_ACCOUNT}/email")
+    log(None, None, "BOT", f"Workers        : {MAX_WORKERS} (email round-robin chunks)")
+
+    if (not USE_SESSION_TEMPLATE or SKIP_SESSION_PROXY) and not PROXY_STATIC_LIST:
+        log(None, None, "FATAL", "PROXY_STATIC_LIST kosong & proxy awal di-skip — jalankan proxy_finder.py dulu!")
+        return
+
+    await fetch_and_sort_coins()
+    await SOLVER.start()
+
+    try:
+        while True:
+            if not os.path.exists(FILE_EMAILS):
+                log(None, None, "FATAL", f"File email tidak ditemukan: {FILE_EMAILS}")
+                return
+            with open(FILE_EMAILS, "r") as f:
+                emails = [l.strip() for l in f if l.strip()]
+            random.shuffle(emails)
+
+            n_emails = len(emails)
+            chunks = [[] for _ in range(MAX_WORKERS)]
+            for i, e in enumerate(emails):
+                chunks[i % MAX_WORKERS].append(e)
+
+            chunk_info = ", ".join(f"W{i+1}={len(c)}" for i, c in enumerate(chunks))
+            log(None, None, "BOT", f"Batch emails  : {n_emails} → split {chunk_info}")
+
+            tasks = []
+            for i in range(1, MAX_WORKERS + 1):
+                tasks.append(asyncio.create_task(worker(i, chunks[i - 1])))
+                await asyncio.sleep(2)
+            await asyncio.gather(*tasks)
+            # Semua email batch ini selesai → cek ulang status refill dari awal
+            if _refilled_coins:
+                rechecked = ", ".join(c.upper() for c in list(_refilled_coins))
+                log(None, None, "COIN",
+                    f"Semua email batch selesai — reset blacklist refill "
+                    f"({rechecked}); coin dicek ulang dari batch berikutnya")
+                _refilled_coins.clear()
+            await fetch_and_sort_coins()   # refresh harga & urutan coin tiap batch
+            await asyncio.sleep(10)
+    finally:
+        await SOLVER.stop()
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print(Fore.RED + "\n[-] Dihentikan paksa oleh user.")

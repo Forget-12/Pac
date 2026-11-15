@@ -1,0 +1,14 @@
+{
+ "ok": false,
+ "url": "https://satoshifaucet.io/faucet/currency/ltc",
+ "title": "Just a moment...",
+ "has_csrf": false,
+ "has_login": false,
+ "clearance": false,
+ "cookies": {
+  "csrf_cookie_name": "23b09a9e618a801e40c36cffdb675e0c",
+  "ci_session": "m38kun073skg30up76g01kah7q4aogem"
+ },
+ "body": "satoshifaucet.io\nPerforming security verification\n\nThis website uses a security service to protect against malicious bots. This page is displayed while the website verifies you are not a bot.\n\nWhy is this verification taking longer?\n\nThis verification can take longer due to an older computer or a slow internet connection.\n\nWhat to do next:\n\nWait briefly. Refreshing the page will restart the security verification and may take longer.\nIf the verification still does not complete, refresh this page.",
+ "ts": "2026-11-12T10:59:53.893Z"
+}

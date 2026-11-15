@@ -3,3 +3,14 @@ solver.log
 cf_log.txt
 cloudflared
 Api.zip
+.env
+*.pyc
+__pycache__/
+.trash-artifak/
+*.png
+*.log
+archive/
+archive_raw/
+archive_index.jsonl
+archive_index_fixed.jsonl
+.skip_session_proxy

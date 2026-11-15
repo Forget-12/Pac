@@ -1,0 +1,15 @@
+{
+ "ok": true,
+ "url": "https://satoshifaucet.io/",
+ "title": "SatoshiFaucet | Satoshi faucet",
+ "has_csrf": true,
+ "has_login": true,
+ "clearance": true,
+ "cookies": {
+  "ci_session": "ipbtq8tjai2c0cp0n08da40aknrdr43e",
+  "csrf_cookie_name": "e50ef0288267a96abeb95a4b46cb7cb8",
+  "cf_clearance": "CtyynGz_f80XCAXvWRrFc6xH_dgktnZdMtuLFzL-FSMLITtn7QP6WnkQrzzhOACK_r_7tUFTV1MCrk6f6aFVcPbtzrdciX0_kBPVVmRWy-HZFL3gP1MBVEjWuO6peIVssoBjCSIdaUrDIR8otF5Gl4eO6mOZ856-rZOL7sZZ6Obv9wD7A1fcch2p6qEvSsoqQXaw6dmGsugoHNMBTZhxgokEwLwQmYFzaEj5TPmdpBl8mrrp5cZGxy6jbRRuzo6R3hsmrvy4FL7hSZiBI1YtSvksGKBXs3bJfwCDTad0L90aouIHmDspvabzFQXKREw2asEy7KRr6pjeh36OtoIzN9FWsRUOY7e3JBKBeTX5VS9c-mo7PwLm02s01kCxQNv_uPzLJstYfoazdR1ljHq2AS730N0E9Hh9-BObGMARO4Lm3h1adUn6iMr2faq1HLFkSQg4Ppfd"
+ },
+ "body": "Faucet\nMembers Benefits\nSupported Coins\nPayment Proof\nFAQs\nFree Cryptos\nClaim Instantly\n\n\nLogin Now\n\n\n\nDon't Have A FaucetPay Account? Create One\n\n\n\n\nBe A Earner\n\nGet A Tons Of Benefits\n\nEarn free coin every 10 Seconds\n\nEarn up to 30% from your referrals\n\nInstant payments to FaucetPay\n\nClaim from Faucet, Shortlinks\n\n100% Free To Use\n\nNo Deposit Required to get Payments!\n\nConfused?\n\nCheck Recent Payments\n#\tFaucetPay Email\tAmount\tTime\n3081591\tab******491@gmail.com\t0.00000134 SOL\t1 Second ago\n30815",
+ "ts": "2026-11-12T12:39:01.158Z"
+}
