@@ -66,14 +66,26 @@ class Adslab:
         expected_len = init_data.get("expectedLength", 3)
         
         img_base64 = None
-        if "gifTraps" in init_data and init_data["gifTraps"]:
-            img_base64 = init_data["gifTraps"][0]
-        elif "base64Traps" in init_data and init_data["base64Traps"]:
-            img_base64 = init_data["base64Traps"][0]
-        elif "captchaUrl" in init_data:
+        
+        # PRIORITAS 1: Unduh gambar asli dari captchaUrl
+        if "captchaUrl" in init_data and init_data["captchaUrl"]:
             url = init_data["captchaUrl"]
-            resp = self.session.get(url, headers=self.headers, timeout=30)
-            img_base64 = base64.b64encode(resp.content).decode('utf-8')
+            if not url.startswith("http"):
+                url = "https://adslab.me" + (url if url.startswith("/") else "/" + url)
+            try:
+                resp = self.session.get(url, headers=self.headers, timeout=30)
+                img_base64 = base64.b64encode(resp.content).decode('utf-8')
+                print(f"[AdsLab] Gambar diunduh dari captchaUrl: {len(img_base64)} chars")
+            except Exception as e:
+                print(f"[AdsLab] Gagal unduh captchaUrl: {e}")
+
+        # PRIORITAS 2: Jika tidak ada captchaUrl, coba gifTraps
+        if not img_base64 and "gifTraps" in init_data and init_data["gifTraps"]:
+            img_base64 = init_data["gifTraps"][0]
+
+        # PRIORITAS 3: Jika tidak ada, coba base64Traps
+        if not img_base64 and "base64Traps" in init_data and init_data["base64Traps"]:
+            img_base64 = init_data["base64Traps"][0]
 
         if isinstance(img_base64, dict):
             img_base64 = img_base64.get("data") or img_base64.get("image")
@@ -84,9 +96,13 @@ class Adslab:
         try:
             if not AlcaptchaSolver: raise AdslabError("File alc_ori.py tidak ditemukan")
             solver = AlcaptchaSolver()
-            if "," in img_base64: img_base64 = img_base64.split(",", 1)[1]
             
-            # PERBAIKAN: Panggil async function menggunakan asyncio.run()
+            # Perbaikan Padding Base64
+            if "," in img_base64:
+                img_base64 = img_base64.split(",", 1)[1]
+            # Tambahkan padding '=' jika panjang string bukan kelipatan 4
+            img_base64 += "=" * ((4 - len(img_base64) % 4) % 4)
+            
             result = asyncio.run(solver.solve(img_base64, expected=expected_len))
             
             if not isinstance(result, dict) or not result.get("answer") or not result["answer"].get("coord"):
