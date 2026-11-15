@@ -19,12 +19,15 @@ WORKDIR /app
 COPY package*.json ./
 RUN npm install
 
+# INI BAGIAN PENTINGNYA: Buat Virtual Environment sebelum install pip
+RUN python3 -m venv $VIRTUAL_ENV
+
 COPY requirements.txt .
 RUN pip3 install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-# Ekstrak cfsolve tepat di folder /app
+# Ekstrak cfsolve ke /app
 RUN unzip -o cfsolve.zip -d . && chmod +x cfsolve || true
 RUN unzip -o profiles.zip -d profiles || true
 
