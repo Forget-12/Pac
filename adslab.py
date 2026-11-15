@@ -1,10 +1,39 @@
-import json, base64, urllib.parse, hashlib, time, asyncio, random
+import asyncio
+import base64
+import hashlib
+import json
+import os
+import random
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
-from curl_cffi import requests
-from alc_ori import AlcaptchaSolver
-from utils import CaptchaError
 
-class AdslabError(Exception): pass
+from curl_cffi import requests
+
+try:
+    from .utils import CaptchaError
+except ImportError:
+    from utils import CaptchaError
+
+_POW_CHARS = "abcdefghijklmnopqrstuvwxyz0123456789"
+_INTERNAL_ERROR = "Internal solver error occurred, please try again later"
+
+_alc_solve = None
+
+def _get_alc_solve():
+    global _alc_solve
+    if _alc_solve is None:
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        if current_dir not in sys.path:
+            sys.path.insert(0, current_dir)
+        try:
+            # Menggunakan Class dari file alc_ori.py Anda
+            from alc_ori import AlcaptchaSolver
+            _alc_solve = AlcaptchaSolver().solve
+        except ImportError:
+            raise Exception("alc_ori.py atau Class AlcaptchaSolver tidak ditemukan")
+    return _alc_solve
 
 class Adslab:
     def __init__(self, sitekey, siteurl, sub_id="widget_user", proxy=None, cookies=None):
@@ -51,7 +80,6 @@ class Adslab:
         except ValueError: return None
 
     def _generate_pow(self):
-        _POW_CHARS = "abcdefghijklmnopqrstuvwxyz0123456789"
         seed = f"{''.join(random.choices(_POW_CHARS, k=13))}{int(time.time() * 1000)}"
         prefix = seed.encode('utf-8')
         sha256 = hashlib.sha256
@@ -78,7 +106,7 @@ class Adslab:
         if len(body) > 200: body = body[:200] + "…"
         return f"HTTP Error {response.status_code}: {body}"
 
-    def _init_captcha(self, session):
+    def _init_captcha(self, session=None):
         pow_data = self._generate_pow()
         payload = {"sitekey": self.sitekey, "domain": self.siteurl, "subid": self.sub_id, "pow": pow_data}
         headers = {
@@ -88,38 +116,42 @@ class Adslab:
             "Sec-Fetch-Mode": "cors", "Sec-Fetch-Site": "cross-site"
         }
         init_url = f"{self.base_url}{self.api_path}/init"
+        own_session = session is None
+        if own_session: session = self._get_session()
+
         try:
             response = session.post(init_url, json=payload, headers=headers, proxies=self.proxy_dict, timeout=15)
             data = self._decode_json(response)
             if response.status_code >= 400:
-                return CaptchaError.unsolvable(self._error_message(response, data), "Internal solver error")
+                return CaptchaError.unsolvable(self._error_message(response, data), _INTERNAL_ERROR)
             if not isinstance(data, dict):
-                return CaptchaError.unsolvable(f"Invalid JSON response (HTTP {response.status_code})", "Internal solver error")
+                return CaptchaError.unsolvable(f"Invalid JSON response (HTTP {response.status_code})", _INTERNAL_ERROR)
             if not data.get("success"):
-                return CaptchaError.unsolvable(data.get('message', 'Unknown API response'), "Internal solver error")
-            return data
+                return CaptchaError.unsolvable(data.get('message', 'Unknown API response'), _INTERNAL_ERROR)
+            return data, session
         except Exception as e:
-            return CaptchaError.unsolvable(str(e), "Internal solver error")
+            return CaptchaError.unsolvable(str(e), _INTERNAL_ERROR)
 
     def _load_captcha(self, url, session):
         try:
             response = session.get(url, proxies=self.proxy_dict, timeout=15)
             if response.status_code >= 400:
-                return CaptchaError.unsolvable(self._error_message(response, None), "Internal solver error")
+                return CaptchaError.unsolvable(self._error_message(response, None), _INTERNAL_ERROR)
             return base64.b64encode(response.content).decode('utf-8')
         except Exception as e:
-            return CaptchaError.unsolvable(str(e), "Internal solver error")
+            return CaptchaError.unsolvable(str(e), _INTERNAL_ERROR)
 
-    def _solve_motion(self, b64_img, expected=0):
+    async def _solve_motion(self, b64_img, debug=False, expected=0):
         try:
-            solver = AlcaptchaSolver()
-            result = asyncio.run(solver.solve(b64_img, debug=False, expected=expected))
+            solve_alc = _get_alc_solve()
+            # Memanggil fungsi async dari alc_ori.py
+            result = await solve_alc(b64_img, debug=debug, expected=expected)
             if isinstance(result, CaptchaError): return result
             if not result or not result.get("answer"):
                 return CaptchaError.unsolvable("SOLVER_NO_ANSWER", "Solver returned no answer")
             return result
         except Exception as e:
-            return CaptchaError.unsolvable(str(e), "Internal solver error")
+            return CaptchaError.unsolvable(str(e), _INTERNAL_ERROR)
 
     def _build_verify_payload(self, token, target_ids, indices, start_time_ms):
         vt, ct = [], []
@@ -145,30 +177,37 @@ class Adslab:
             "User-Agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Mobile Safari/537.36"
         }
         verify_url = f"{self.base_url}{self.api_path}/verify-click"
+
         try:
             resp = session.post(verify_url, json=final_payload, headers=headers, proxies=self.proxy_dict, timeout=15)
             result = self._decode_json(resp)
             if resp.status_code >= 400:
-                return CaptchaError.unsolvable(self._error_message(resp, result), "Internal solver error")
+                return CaptchaError.unsolvable(self._error_message(resp, result), _INTERNAL_ERROR)
             if not isinstance(result, dict):
-                return CaptchaError.unsolvable(f"Invalid JSON response (HTTP {resp.status_code})", "Internal solver error")
+                return CaptchaError.unsolvable(f"Invalid JSON response (HTTP {resp.status_code})", _INTERNAL_ERROR)
             if not result.get("success"):
                 return CaptchaError.unsolvable(result.get('message', 'Verify API returned success=false'), "Solver failed to find any valid solution.")
             return result.get("token")
         except Exception as e:
-            return CaptchaError.unsolvable(str(e), "Internal solver error")
+            return CaptchaError.unsolvable(str(e), _INTERNAL_ERROR)
 
-    def solve(self):
+    async def solve(self, debug=False):
         start_time = time.perf_counter()
-        session = self._get_session()
+        loop = asyncio.get_running_loop()
+        http_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="adslab-http")
+        session = None
+        
         try:
-            data = self._init_captcha(session)
-            if isinstance(data, CaptchaError): return data
+            session = await loop.run_in_executor(http_executor, self._get_session)
+            init_result = await loop.run_in_executor(http_executor, self._init_captcha, session)
             
-            b64_img = self._load_captcha(data["captchaUrl"], session)
+            if isinstance(init_result, CaptchaError): return init_result
+            data, session = init_result
+
+            b64_img = await loop.run_in_executor(http_executor, self._load_captcha, data["captchaUrl"], session)
             if isinstance(b64_img, CaptchaError): return b64_img
 
-            solved = self._solve_motion(b64_img, expected=data.get("expectedLength", 0))
+            solved = await self._solve_motion(b64_img, debug=debug, expected=data.get("expectedLength", 0))
             if isinstance(solved, CaptchaError): return solved
 
             indices = solved.get("answer", {}).get("index", [])
@@ -191,15 +230,18 @@ class Adslab:
                         target_elements.append(cell_id)
                         break
                 else:
-                    return CaptchaError.unsolvable(f"Target index {idx_str} not found", "Internal solver error")
+                    return CaptchaError.unsolvable(f"Target index {idx_str} not found", _INTERNAL_ERROR)
 
             if not target_elements:
-                return CaptchaError.unsolvable("Resulted indices mapped to 0 valid targets", "Internal solver error")
+                return CaptchaError.unsolvable("Resulted indices mapped to 0 valid targets", _INTERNAL_ERROR)
 
-            final_token = self._verify(data["token"], target_elements, indices, int(start_time * 1000), session)
+            final_token = await loop.run_in_executor(
+                http_executor, self._verify, data["token"], target_elements, indices, int(start_time * 1000), session
+            )
             if isinstance(final_token, CaptchaError): return final_token
-
             return {"token": final_token}
         finally:
-            try: session.close()
-            except Exception: pass
+            if session is not None:
+                try: await loop.run_in_executor(http_executor, session.close)
+                except Exception: pass
+            http_executor.shutdown(wait=False)

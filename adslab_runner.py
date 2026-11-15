@@ -1,4 +1,7 @@
-import sys, json, traceback
+import sys
+import json
+import traceback
+import asyncio
 from adslab import Adslab
 from utils import CaptchaError
 
@@ -20,7 +23,9 @@ def main():
             raise ValueError("websiteKey & websiteURL wajib diisi")
 
         solver = Adslab(sitekey, siteurl, subid, proxy, cookies)
-        result = solver.solve() # Sinkron!
+        
+        # MENGGUNAKAN ASYNCIO.RUN UNTUK MEMANGGIL FUNGSI ASYNC
+        result = asyncio.run(solver.solve())
         
         if isinstance(result, CaptchaError):
             raise Exception(str(result))
