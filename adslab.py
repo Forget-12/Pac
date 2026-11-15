@@ -48,7 +48,6 @@ class Adslab:
 
     def _generate_pow(self, seed="dummy_seed_123"):
         nonce = 0
-        # Coba maksimal 500.000 iterasi agar tidak timeout
         while nonce < 500000:
             text = f"{seed}{nonce}"
             h = hashlib.sha256(text.encode()).hexdigest()
@@ -63,26 +62,35 @@ class Adslab:
         if not init_data.get("success"):
             raise AdslabError(f"Gagal init: {init_data}")
 
-        # AdsLab kadang mengembalikan token, bukan challenge_id
         challenge_token = init_data.get("token")
+        expected_len = init_data.get("expectedLength", 3)
         
-        # Ekstrak gambar base64 (biasanya di dalam array 'images' atau field 'image')
         img_base64 = None
-        if "images" in init_data and len(init_data["images"]) > 0:
-            img_base64 = init_data["images"][0].get("data") or init_data["images"][0].get("image")
-        elif "image" in init_data:
-            img_base64 = init_data["image"]
+        # Ekstrak gambar dari format JSON baru
+        if "gifTraps" in init_data and init_data["gifTraps"]:
+            img_base64 = init_data["gifTraps"][0]
+        elif "base64Traps" in init_data and init_data["base64Traps"]:
+            img_base64 = init_data["base64Traps"][0]
+        elif "captchaUrl" in init_data:
+            # Jika hanya ada URL, download gambarnya
+            url = init_data["captchaUrl"]
+            resp = self.session.get(url, headers=self.headers, timeout=30)
+            img_base64 = base64.b64encode(resp.content).decode('utf-8')
+
+        # Validasi apakah gambarnya berbentuk dict (kadang AdsLab membungkusnya)
+        if isinstance(img_base64, dict):
+            img_base64 = img_base64.get("data") or img_base64.get("image")
 
         if not challenge_token or not img_base64:
-            raise AdslabError(f"Format respons tidak dikenali: {list(init_data.keys())}")
+            raise AdslabError(f"Gagal ekstrak gambar dari: {list(init_data.keys())}")
 
         try:
             if not AlcaptchaSolver: raise AdslabError("File alc_ori.py tidak ditemukan")
             solver = AlcaptchaSolver()
             if "," in img_base64: img_base64 = img_base64.split(",", 1)[1]
             
-            # Panggil OpenCV
-            result = solver.solve(img_base64, expected=3)
+            # Panggil OpenCV dengan jumlah gambar dinamis
+            result = solver.solve(img_base64, expected=expected_len)
             if not result or not result.get("answer") or not result["answer"].get("coord"):
                 raise AdslabError("Gagal mendeteksi koordinat")
                 
@@ -100,34 +108,25 @@ class Adslab:
 
     def _init_captcha(self):
         url = "https://adslab.me/api/v1/alcaptcha/init"
-        
-        # Buat POW baru setiap request
-        pow_data = self._generate_pow()
-        
         payload = {
             "sitekey": self.sitekey, 
             "subid": self.subid,
             "domain": self.hostname,
-            "pow": pow_data # <-- KUNCI SUKSESNYA DI SINI
+            "pow": self._generate_pow() 
         }
-        
         resp = self.session.post(url, json=payload, headers=self.headers, timeout=30)
         if resp.status_code != 200: raise AdslabError(f"Init failed HTTP {resp.status_code}: {resp.text[:100]}")
         return resp.json()
 
     def _verify(self, token, answers):
         url = "https://adslab.me/api/v1/alcaptcha/verify"
-        
-        pow_data = self._generate_pow() # Beberapa API butuh POW lagi saat verify
-        
         payload = {
             "token": token, 
             "sitekey": self.sitekey,
             "subid": self.subid, 
             "answers": answers,
-            "pow": pow_data
+            "pow": self._generate_pow()
         }
-        
         resp = self.session.post(url, json=payload, headers=self.headers, timeout=30)
         if resp.status_code == 200: 
             return resp.json().get("token")
