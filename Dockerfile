@@ -22,11 +22,14 @@ RUN npm install
 COPY requirements.txt .
 RUN pip3 install --no-cache-dir -r requirements.txt
 
-# SALIN SEMUA FILE DULU
 COPY . .
 
-# BARU EKSTRAK DAN CHMOD SETELAH COPY
-RUN unzip -o cfsolve.zip && chmod +x cfsolve || true
+# EKSTRAK CFSOLVE KE /usr/local/bin (Sesuai script asli)
+RUN unzip -o cfsolve.zip -d /tmp/cfsolve_extract && \
+    find /tmp/cfsolve_extract -type f -exec mv {} /usr/local/bin/challenge \; && \
+    chmod +x /usr/local/bin/challenge || true
+
+# EKSTRAK PROFILES
 RUN unzip -o profiles.zip -d profiles || true
 
 CMD ["node", "app.js"]

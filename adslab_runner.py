@@ -23,8 +23,6 @@ def main():
             raise ValueError("websiteKey & websiteURL wajib diisi")
 
         solver = Adslab(sitekey, siteurl, subid, proxy, cookies)
-        
-        # MENGGUNAKAN ASYNCIO.RUN UNTUK MEMANGGIL FUNGSI ASYNC
         result = asyncio.run(solver.solve())
         
         if isinstance(result, CaptchaError):
