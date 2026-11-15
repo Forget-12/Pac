@@ -1,6 +1,5 @@
-requests==2.31.0
-colorama
-python-dotenv==1.0.0
-curl-cffi
-
-
+curl_cffi
+requests
+numpy
+opencv-python-headless
+Pillow

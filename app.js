@@ -1,6 +1,3 @@
-/**
- * app.js — Universal Captcha Solver API (Railway)
- */
 const express = require("express");
 const crypto = require("crypto");
 const { spawn } = require("child_process");
@@ -14,7 +11,6 @@ const PORT = process.env.PORT || 3000;
 const MAX_ACTIVE = parseInt(process.env.MAX_ACTIVE, 10) || 2;
 const MAX_QUEUE = parseInt(process.env.MAX_QUEUE, 10) || 10;
 const TASK_TIMEOUT = parseInt(process.env.TASK_TIMEOUT, 10) || 120000;
-const CLEANUP_INTERVAL = 60000;
 
 const queue = [];
 const activeTasks = new Set();
@@ -28,7 +24,7 @@ function processQueue() {
     const timeoutTimer = setTimeout(() => {
         if (activeTasks.has(task.id)) {
             activeTasks.delete(task.id);
-            results.set(task.id, { status: "error", err: { usr: "ERROR_TIMEOUT", api: "Task timeout exceeded" }, timestamp: Date.now() });
+            results.set(task.id, { status: "error", err: { usr: "ERROR_TIMEOUT", api: "Timeout" }, timestamp: Date.now() });
             processQueue();
         }
     }, TASK_TIMEOUT);
@@ -42,42 +38,54 @@ function processQueue() {
     };
 
     if (task.type === "AdsLabTask") runAdslab(task.data, cleanup);
+    else if (task.type === "CFWafTask") runCfWaf(task.data, cleanup);
     else runTurnstile(task.data, cleanup);
 }
 
 function runAdslab(data, callback) {
-    console.log(`[AdsLab] Memulai task...`);
     const py = spawn("python3", ["adslab_runner.py"], { cwd: __dirname, stdio: ["pipe", "pipe", "pipe"] });
-    let stdoutData = "", stderrData = "";
-    py.stdout.on("data", (c) => stdoutData += c.toString());
-    py.stderr.on("data", (c) => stderrData += c.toString());
-    py.on("close", (code) => {
-        if (code !== 0 || !stdoutData.trim()) return callback("error", null, { usr: "ERROR_CAPTCHA_UNSOLVABLE", api: stderrData });
+    let out = "", err = "";
+    py.stdout.on("data", c => out += c.toString());
+    py.stderr.on("data", c => err += c.toString());
+    py.on("close", () => {
         try {
-            const parsed = JSON.parse(stdoutData.trim().split("\n").pop());
-            if (parsed.ok && parsed.token) callback("ready", { token: parsed.token });
+            const parsed = JSON.parse(out.trim().split("\n").pop());
+            if (parsed.ok) callback("ready", { token: parsed.token });
             else callback("error", null, { usr: "ERROR_CAPTCHA_UNSOLVABLE", api: parsed.error });
-        } catch (e) {
-            callback("error", null, { usr: "ERROR_PARSE", api: "Invalid JSON" });
-        }
+        } catch (e) { callback("error", null, { usr: "PARSE_ERROR", api: out || err }); }
+    });
+    py.stdin.write(JSON.stringify({ task: data }) + "\n");
+    py.stdin.end();
+}
+
+function runCfWaf(data, callback) {
+    const py = spawn("python3", ["cf_waf_solver.py"], { cwd: __dirname, stdio: ["pipe", "pipe", "pipe"] });
+    let out = "", err = "";
+    py.stdout.on("data", c => out += c.toString());
+    py.stderr.on("data", c => err += c.toString());
+    py.on("close", () => {
+        try {
+            const parsed = JSON.parse(out.trim().split("\n").pop());
+            if (parsed.ok) callback("ready", { token: parsed.token, ua: parsed.ua, type: parsed.type });
+            else callback("error", null, { usr: "ERROR_CF_WAF", api: parsed.error });
+        } catch (e) { callback("error", null, { usr: "PARSE_ERROR", api: out || err }); }
     });
     py.stdin.write(JSON.stringify({ task: data }) + "\n");
     py.stdin.end();
 }
 
 function runTurnstile(data, callback) {
-    console.log(`[Turnstile] Memulai task...`);
     const binPath = path.join(__dirname, "cfsolve");
-    if (!fs.existsSync(binPath)) return callback("error", null, { usr: "ERROR_SETUP", api: "cfsolve not found" });
+    if (!fs.existsSync(binPath)) return callback("error", null, { usr: "ERROR_SETUP", api: "cfsolve missing" });
     const args = [data.websiteURL, data.websiteKey || ""];
     if (data.proxy) args.push("--proxy", data.proxy);
     const child = spawn(binPath, args, { cwd: __dirname });
-    let stdoutData = "", stderrData = "";
-    child.stdout.on("data", (c) => stdoutData += c.toString());
-    child.stderr.on("data", (c) => stderrData += c.toString());
+    let out = "", err = "";
+    child.stdout.on("data", c => out += c.toString());
+    child.stderr.on("data", c => err += c.toString());
     child.on("close", (code) => {
-        if (code !== 0) return callback("error", null, { usr: "ERROR_CAPTCHA_UNSOLVABLE", api: stderrData });
-        const output = stdoutData.trim();
+        if (code !== 0) return callback("error", null, { usr: "ERROR_CAPTCHA_UNSOLVABLE", api: err });
+        const output = out.trim();
         try {
             const parsed = JSON.parse(output);
             if (parsed.token) return callback("ready", { token: parsed.token });
@@ -110,6 +118,6 @@ app.post("/solve", (req, res) => {
 setInterval(() => {
     const now = Date.now();
     for (const [id, data] of results.entries()) if (now - data.timestamp > 300000) results.delete(id);
-}, CLEANUP_INTERVAL);
+}, 60000);
 
 app.listen(PORT, () => console.log(`🚀 Server on port ${PORT}`));
