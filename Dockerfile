@@ -1,8 +1,7 @@
 FROM node:20-slim
 
-# Install system dependencies (Chromium, Python, dll)
 RUN apt-get update && apt-get install -y \
-    chromium python3 python3-pip python3-venv \
+    chromium python3 python3-pip python3-venv unzip \
     fonts-liberation libasound2 libatk-bridge2.0-0 libatk1.0-0 libc6 \
     libcairo2 libcups2 libdbus-1-3 libexpat1 libfontconfig1 libgbm1 \
     libgcc1 libglib2.0-0 libgtk-3-0 libnspr4 libnss3 libpango-1.0-0 \
@@ -20,12 +19,16 @@ WORKDIR /app
 COPY package*.json ./
 RUN npm install
 
-# Buat venv dan install dependensi Python
+# Ekstrak cfsolve & profiles dari zip
+COPY cfsolve.zip profiles.zip ./
+RUN unzip -o cfsolve.zip && chmod +x cfsolve || true
+RUN unzip -o profiles.zip -d profiles || true
+
+# Setup Python
 RUN python3 -m venv $VIRTUAL_ENV
 COPY requirements.txt .
 RUN pip3 install --no-cache-dir -r requirements.txt
 
 COPY . .
-RUN chmod +x cfsolve || true
 
 CMD ["node", "app.js"]
