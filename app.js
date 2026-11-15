@@ -53,8 +53,9 @@ function runAdslab(data, callback) {
             const parsed = JSON.parse(out.trim().split("\n").pop());
             if (parsed.ok) callback("ready", { token: parsed.token });
             else callback("error", null, { usr: "ERROR_CAPTCHA_UNSOLVABLE", api: parsed.error });
-        } catch (e) { callback("error", null, { usr: "PARSE_ERROR", api: err }); }
+        } catch (e) { callback("error", null, { usr: "PARSE_ERROR", api: err || out }); }
     });
+    py.on("error", (e) => callback("error", null, { usr: "SPAWN_ERROR", api: e.message }));
     py.stdin.write(JSON.stringify({ task: data }) + "\n");
     py.stdin.end();
 }
@@ -70,8 +71,9 @@ function runCfWaf(data, callback) {
             const parsed = JSON.parse(out.trim().split("\n").pop());
             if (parsed.ok) callback("ready", { token: parsed.token, ua: parsed.ua, type: parsed.type });
             else callback("error", null, { usr: "ERROR_CF_WAF", api: parsed.error });
-        } catch (e) { callback("error", null, { usr: "PARSE_ERROR", api: err }); }
+        } catch (e) { callback("error", null, { usr: "PARSE_ERROR", api: err || out }); }
     });
+    py.on("error", (e) => callback("error", null, { usr: "SPAWN_ERROR", api: e.message }));
     py.stdin.write(JSON.stringify({ task: data }) + "\n");
     py.stdin.end();
 }
@@ -79,13 +81,28 @@ function runCfWaf(data, callback) {
 function runTurnstile(data, callback) {
     console.log(`[Turnstile] Memulai task...`);
     const binPath = path.join(__dirname, "cfsolve");
-    if (!fs.existsSync(binPath)) return callback("error", null, { usr: "ERROR_SETUP", api: "cfsolve missing" });
+    
+    if (!fs.existsSync(binPath)) {
+        return callback("error", null, { usr: "ERROR_SETUP", api: "cfsolve missing" });
+    }
+
+    // Paksa file agar bisa dieksekusi (mengatasi EACCES)
+    try { fs.chmodSync(binPath, '755'); } catch (e) { console.error("Chmod error:", e.message); }
+
     const args = [data.websiteURL, data.websiteKey || ""];
     if (data.proxy) args.push("--proxy", data.proxy);
+    
     const child = spawn(binPath, args, { cwd: __dirname });
     let out = "", err = "";
+    
     child.stdout.on("data", c => out += c.toString());
     child.stderr.on("data", c => err += c.toString());
+
+    // TANGKAP ERROR SPAWN AGAR SERVER TIDAK CRASH
+    child.on("error", (error) => {
+        callback("error", null, { usr: "ERROR_SPAWN", api: error.message });
+    });
+
     child.on("close", (code) => {
         if (code !== 0) return callback("error", null, { usr: "ERROR_CAPTCHA_UNSOLVABLE", api: err });
         const output = out.trim();

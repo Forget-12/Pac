@@ -19,16 +19,14 @@ WORKDIR /app
 COPY package*.json ./
 RUN npm install
 
-# Ekstrak cfsolve & profiles dari zip
-COPY cfsolve.zip profiles.zip ./
-RUN unzip -o cfsolve.zip && chmod +x cfsolve || true
-RUN unzip -o profiles.zip -d profiles || true
-
-# Setup Python
-RUN python3 -m venv $VIRTUAL_ENV
 COPY requirements.txt .
 RUN pip3 install --no-cache-dir -r requirements.txt
 
+# SALIN SEMUA FILE DULU
 COPY . .
+
+# BARU EKSTRAK DAN CHMOD SETELAH COPY
+RUN unzip -o cfsolve.zip && chmod +x cfsolve || true
+RUN unzip -o profiles.zip -d profiles || true
 
 CMD ["node", "app.js"]
