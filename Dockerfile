@@ -19,6 +19,8 @@ WORKDIR /app
 COPY package*.json ./
 RUN npm install
 
+RUN python3 -m venv $VIRTUAL_ENV
+
 COPY requirements.txt .
 RUN pip3 install --no-cache-dir -r requirements.txt
 
