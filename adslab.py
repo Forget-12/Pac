@@ -34,12 +34,13 @@ class Adslab:
             elif isinstance(cookies, dict):
                 self.cookies = cookies
 
-        self.session = requests.Session(impersonate="chrome110")
+        # Samakan TLS fingerprint dengan User-Agent Mobile di header
+        self.session = requests.Session(impersonate="chrome124")
         if self.proxy: self.session.proxies = {"http": self.proxy, "https": self.proxy}
         if self.cookies: self.session.cookies.update(self.cookies)
             
         self.headers = {
-            "User-Agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Mobile Safari/537.36",
+            "User-Agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
             "Accept": "application/json, text/plain, */*",
             "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
             "Origin": self.origin,
@@ -74,8 +75,8 @@ class Adslab:
         return token
 
     def _init_captcha(self):
-        # KITA UBAH URL-NYA DI SINI: Gunakan /api/v1/...
-        url = "https://adslab.me/api/v1/alcaptcha/init"
+        # Coba gunakan subdomain api.
+        url = "https://api.adslab.me/api/v1/alcaptcha/init"
         payload = {
             "sitekey": self.sitekey, "subid": self.subid,
             "domain": self.hostname
@@ -85,8 +86,7 @@ class Adslab:
         return resp.json()
 
     def _verify(self, challenge_id, answers):
-        # KITA UBAH URL-NYA DI SINI: Gunakan /api/v1/...
-        url = "https://adslab.me/api/v1/alcaptcha/verify"
+        url = "https://api.adslab.me/api/v1/alcaptcha/verify"
         payload = {
             "challenge_id": challenge_id, "sitekey": self.sitekey,
             "subid": self.subid, "answers": answers
