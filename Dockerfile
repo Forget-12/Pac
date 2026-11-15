@@ -24,12 +24,8 @@ RUN pip3 install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-# EKSTRAK CFSOLVE KE /usr/local/bin (Sesuai script asli)
-RUN unzip -o cfsolve.zip -d /tmp/cfsolve_extract && \
-    find /tmp/cfsolve_extract -type f -exec mv {} /usr/local/bin/challenge \; && \
-    chmod +x /usr/local/bin/challenge || true
-
-# EKSTRAK PROFILES
+# Ekstrak cfsolve tepat di folder /app
+RUN unzip -o cfsolve.zip -d . && chmod +x cfsolve || true
 RUN unzip -o profiles.zip -d profiles || true
 
 CMD ["node", "app.js"]

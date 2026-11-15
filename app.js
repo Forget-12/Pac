@@ -1,152 +1,206 @@
 const express = require("express");
+const { execFile, spawn } = require("child_process");
 const crypto = require("crypto");
-const { spawn } = require("child_process");
-const path = require("path");
 const fs = require("fs");
+const path = require("path");
+const os = require("os");
 
 const app = express();
+const port = process.env.PORT || 3000;
 app.use(express.json({ limit: "50mb" }));
 
-const PORT = process.env.PORT || 3000;
-const MAX_ACTIVE = parseInt(process.env.MAX_ACTIVE, 10) || 2;
-const MAX_QUEUE = parseInt(process.env.MAX_QUEUE, 10) || 10;
+// Gunakan /app/cfsolve (sesuai Dockerfile baru)
+const CFSOLVE_BIN = process.env.CFSOLVE_BIN || "/app/cfsolve"; 
 const TASK_TIMEOUT = parseInt(process.env.TASK_TIMEOUT, 10) || 120000;
+const TASKS_FILE = path.join(os.tmpdir(), "tasks.json");
+const PROFILES_DIR = "/app/profiles";
 
+const PYTHON_BIN = process.env.PYTHON_BIN || "python3";
+const ADSLAB_RUNNER = path.join(__dirname, "adslab_runner.py");
+const WAF_RUNNER = path.join(__dirname, "cf_waf_solver.py");
+
+const MAX_ACTIVE = 2; 
+const MAX_QUEUE = 8;   
+
+let activeTasks = 0;
 const queue = [];
-const activeTasks = new Set();
-const results = new Map();
+
+let PROFILES = [];
+try {
+    const dirs = fs.readdirSync(PROFILES_DIR, { withFileTypes: true })
+        .filter(dirent => dirent.isDirectory()).map(dirent => dirent.name);
+    for (const dir of dirs) {
+        const mainJsonPath = path.join(PROFILES_DIR, dir, "main.json");
+        if (fs.existsSync(mainJsonPath)) PROFILES.push(mainJsonPath);
+    }
+} catch (e) { console.error("Gagal baca profil:", e.message); }
+if (PROFILES.length === 0) PROFILES.push("/app/profiles/iphone-13/main.json"); 
+
+let profileIndex = 0;
+function getNextProfile() {
+    const prof = PROFILES[profileIndex];
+    profileIndex = (profileIndex + 1) % PROFILES.length;
+    return prof;
+}
+
+let tasks = {};
+if (fs.existsSync(TASKS_FILE)) {
+    try { tasks = JSON.parse(fs.readFileSync(TASKS_FILE, "utf8")); } catch (e) {}
+}
+function saveTasks() { try { fs.writeFileSync(TASKS_FILE, JSON.stringify(tasks, null, 2)); } catch (e) {} }
+
+function runCfsolve(pageUrl, { proxy, sitekey, action, cdata, blankPage, mode, profilePath } = {}) {
+    return new Promise((resolve, reject) => {
+        const workDir = fs.mkdtempSync(path.join(os.tmpdir(), "cfsolve-"));
+        const args = ["--page", pageUrl, workDir, "--solve", "--fingerprint", profilePath];
+        
+        if (proxy) args.push("--proxy", proxy);
+        if (mode === "turnstile" && sitekey) {
+            args.push("--sitekey", sitekey);
+            if (blankPage) args.push("--blank-page");
+            if (action) args.push("--action", action);
+            if (cdata) args.push("--cdata", cdata);
+        }
+        
+        execFile(CFSOLVE_BIN, args, { timeout: TASK_TIMEOUT }, (err, stdout, stderr) => {
+            try { fs.rmSync(workDir, { recursive: true, force: true }); } catch {}
+            if (err) return reject(new Error((stderr || err.message || "").toString().trim().split('\n').pop()));
+            const out = (stdout || "").trim();
+            if (out.startsWith("cf_clearance=")) return resolve({ cf_clearance: out.split("=")[1] });
+            return resolve({ token: out });
+        });
+    });
+}
+
+function runAdslab({ sitekey, siteurl, subId, proxy, cookies } = {}) {
+    return new Promise((resolve, reject) => {
+        const child = spawn(PYTHON_BIN, [ADSLAB_RUNNER], {
+            cwd: __dirname, env: { ...process.env, PYTHONUNBUFFERED: "1", PYTHONIOENCODING: "utf-8" },
+            stdio: ["pipe", "pipe", "pipe"]
+        });
+        let stdout = "", stderr = "", settled = false;
+        let timer = setTimeout(() => { if(!settled) child.kill("SIGKILL"); }, TASK_TIMEOUT);
+        const finish = (handler, value) => { if (settled) return; settled = true; clearTimeout(timer); handler(value); };
+
+        child.stdout.on("data", c => { stdout += c.toString(); console.log(`[Py] ${c.toString().trim()}`); });
+        child.stderr.on("data", c => { stderr += c.toString(); console.error(`[Py-Err] ${c.toString().trim()}`); });
+        child.on("error", err => finish(reject, err));
+        child.on("close", () => {
+            try {
+                const parsed = JSON.parse(stdout.trim().split("\n").pop());
+                if (parsed.ok) finish(resolve, { token: parsed.token });
+                else finish(reject, new Error(parsed.error || "AdsLab failed"));
+            } catch (e) { finish(reject, new Error(stderr.trim().split("\n").pop() || "Invalid JSON AdsLab")); }
+        });
+        child.stdin.end(JSON.stringify({ task: { websiteKey: sitekey, websiteURL: siteurl, subId: subId, proxy: proxy, cookies: cookies } }));
+    });
+}
+
+function runCfWaf({ siteurl, proxy, cookies } = {}) {
+    return new Promise((resolve, reject) => {
+        const child = spawn(PYTHON_BIN, [WAF_RUNNER], {
+            cwd: __dirname, env: { ...process.env, PYTHONUNBUFFERED: "1", PYTHONIOENCODING: "utf-8" },
+            stdio: ["pipe", "pipe", "pipe"]
+        });
+        let stdout = "", stderr = "", settled = false;
+        let timer = setTimeout(() => { if(!settled) child.kill("SIGKILL"); }, TASK_TIMEOUT);
+        const finish = (handler, value) => { if (settled) return; settled = true; clearTimeout(timer); handler(value); };
+
+        child.stdout.on("data", c => { stdout += c.toString(); });
+        child.stderr.on("data", c => { stderr += c.toString(); console.error(`[WAF-Py-Err] ${c.toString().trim()}`); });
+        child.on("error", err => finish(reject, err));
+        child.on("close", () => {
+            try {
+                // Ambil baris terakhir yang mengandung JSON
+                const lines = stdout.trim().split("\n");
+                const lastLine = lines[lines.length - 1];
+                const parsed = JSON.parse(lastLine);
+                if (parsed.ok) finish(resolve, { cf_clearance: parsed.token, ua: parsed.ua, type: parsed.type });
+                else finish(reject, new Error(parsed.error || "CF WAF failed"));
+            } catch (e) { 
+                // Tampilkan error asli jika Python gagal
+                finish(reject, new Error(`Python Error: ${stderr || stdout}`)); 
+            }
+        });
+        child.stdin.end(JSON.stringify({ task: { websiteURL: siteurl, proxy: proxy, cookies: cookies } }));
+    });
+}
 
 function processQueue() {
-    if (activeTasks.size >= MAX_ACTIVE || queue.length === 0) return;
-    const task = queue.shift();
-    activeTasks.add(task.id);
+    while (activeTasks < MAX_ACTIVE && queue.length > 0) {
+        const taskJob = queue.shift();
+        activeTasks++;
+        taskJob.run().finally(() => { activeTasks--; setImmediate(processQueue); });
+    }
+}
 
-    const timeoutTimer = setTimeout(() => {
-        if (activeTasks.has(task.id)) {
-            activeTasks.delete(task.id);
-            results.set(task.id, { status: "error", err: { usr: "ERROR_TIMEOUT", api: "Timeout" }, timestamp: Date.now() });
-            processQueue();
+const solveHandler = async (req, res) => {
+    const body = req.body || {};
+    if (body.taskId && tasks[body.taskId]) return res.json(tasks[body.taskId]);
+    if (!body.task) return res.status(400).json({ error: "Missing task" });
+
+    const task = body.task;
+    const type = String(task.type || "").toLowerCase();
+    const isAdslab = type.includes("ads") || type.includes("alcaptcha");
+    const isWaf = type === "cfwaf" || type === "waf" || type.includes("interstitial");
+    const proxy = process.env.TERTUYUL_PROXY || task.proxy || "";
+    const cookies = task.cookies || "";
+
+    if (queue.length >= MAX_QUEUE) return res.status(429).json({ status: "error", err: { usr: "QUEUE_FULL" } });
+
+    const taskId = crypto.randomUUID().replace(/-/g, "").slice(0, 12);
+    const selectedProfile = (isAdslab || isWaf) ? null : getNextProfile();
+    const profileName = selectedProfile ? path.basename(path.dirname(selectedProfile)) : type;
+
+    tasks[taskId] = { status: "pending", taskId };
+    saveTasks();
+    
+    res.json({ taskId, status: "pending" });
+    console.log(`[TASK] ${taskId} masuk antrean. Tipe: ${profileName}`);
+
+    const taskJob = {
+        run: async () => {
+            try {
+                let solution;
+                if (isAdslab) {
+                    solution = await runAdslab({
+                        sitekey: task.websiteKey || task.sitekey,
+                        siteurl: task.websiteURL || task.siteurl,
+                        subId: task.subId || task.subid || "widget_user",
+                        proxy: proxy, cookies: cookies
+                    });
+                } else if (isWaf) {
+                    solution = await runCfWaf({
+                        siteurl: task.websiteURL || task.siteurl,
+                        proxy: proxy, cookies: cookies
+                    });
+                } else {
+                    const result = await runCfsolve(task.websiteURL || task.websiteUrl, {
+                        proxy, sitekey: task.websiteKey, action: task.action,
+                        cdata: task.cdata, blankPage: task.blankPage, mode: type, profilePath: selectedProfile
+                    });
+                    solution = type === "turnstile" ? { token: result.token } : { cf_clearance: result.cf_clearance };
+                }
+                tasks[taskId] = { status: "ready", taskId, solution };
+                console.log(`[SUKSES] Task ${taskId} selesai (${type})`);
+            } catch (err) {
+                tasks[taskId] = { status: "error", taskId, err: { usr: "ERROR_CAPTCHA_UNSOLVABLE", api: err.message } };
+                console.log(`[GAGAL] Task ${taskId} (${type}): ${err.message}`);
+            } finally {
+                saveTasks();
+                setTimeout(() => { delete tasks[taskId]; saveTasks(); }, 60000);
+            }
         }
-    }, TASK_TIMEOUT);
-
-    const cleanup = (status, solution = null, err = null) => {
-        clearTimeout(timeoutTimer);
-        if (!activeTasks.has(task.id)) return;
-        activeTasks.delete(task.id);
-        results.set(task.id, { status, solution, err, timestamp: Date.now() });
-        processQueue();
     };
 
-    if (task.type === "AdsLabTask") runAdslab(task.data, cleanup);
-    else if (task.type === "CFWafTask") runCfWaf(task.data, cleanup);
-    else runTurnstile(task.data, cleanup);
-}
-
-function runAdslab(data, callback) {
-    console.log(`[AdsLab] Memulai task...`);
-    const py = spawn("python3", ["adslab_runner.py"], { cwd: __dirname, stdio: ["pipe", "pipe", "pipe"] });
-    let out = "", err = "";
-    py.stdout.on("data", c => { out += c.toString(); console.log(`[Py] ${c.toString().trim()}`); });
-    py.stderr.on("data", c => { err += c.toString(); console.error(`[Py-Err] ${c.toString().trim()}`); });
-    py.on("close", () => {
-        try {
-            const parsed = JSON.parse(out.trim().split("\n").pop());
-            if (parsed.ok) callback("ready", { token: parsed.token });
-            else callback("error", null, { usr: "ERROR_CAPTCHA_UNSOLVABLE", api: parsed.error });
-        } catch (e) { callback("error", null, { usr: "PARSE_ERROR", api: err || out }); }
-    });
-    py.on("error", (e) => callback("error", null, { usr: "SPAWN_ERROR", api: e.message }));
-    py.stdin.write(JSON.stringify({ task: data }) + "\n");
-    py.stdin.end();
-}
-
-function runCfWaf(data, callback) {
-    console.log(`[CF-WAF] Memulai task...`);
-    const py = spawn("python3", ["cf_waf_solver.py"], { cwd: __dirname, stdio: ["pipe", "pipe", "pipe"] });
-    let out = "", err = "";
-    py.stdout.on("data", c => { out += c.toString(); console.log(`[WAF-Py] ${c.toString().trim()}`); });
-    py.stderr.on("data", c => { err += c.toString(); console.error(`[WAF-Err] ${c.toString().trim()}`); });
-    py.on("close", () => {
-        try {
-            const parsed = JSON.parse(out.trim().split("\n").pop());
-            if (parsed.ok) callback("ready", { token: parsed.token, ua: parsed.ua, type: parsed.type });
-            else callback("error", null, { usr: "ERROR_CF_WAF", api: parsed.error });
-        } catch (e) { callback("error", null, { usr: "PARSE_ERROR", api: err || out }); }
-    });
-    py.on("error", (e) => callback("error", null, { usr: "SPAWN_ERROR", api: e.message }));
-    py.stdin.write(JSON.stringify({ task: data }) + "\n");
-    py.stdin.end();
-}
-
-function runTurnstile(data, callback) {
-    console.log(`[Turnstile] Memulai task...`);
-    let binPath = path.join(__dirname, "cfsolve");
-    
-    // Deteksi jika cfsolve ternyata berupa folder
-    if (fs.existsSync(binPath) && fs.statSync(binPath).isDirectory()) {
-        console.log(`[Turnstile] Peringatan: cfsolve adalah folder, mencari file di dalamnya...`);
-        binPath = path.join(binPath, "cfsolve");
-    }
-
-    if (!fs.existsSync(binPath)) {
-        return callback("error", null, { usr: "ERROR_SETUP", api: "cfsolve binary missing" });
-    }
-
-    // Paksa permission 755
-    try { fs.chmodSync(binPath, 0o755); } catch (e) { console.error("Chmod error:", e.message); }
-
-    const args = [`"${data.websiteURL}"`, `"${data.websiteKey || ""}"`];
-    if (data.proxy) args.push("--proxy", `"${data.proxy}"`);
-    
-    // Gunakan sh -c agar terhindar dari EACCES Node.js
-    const cmd = `"${binPath}" ${args.join(' ')}`;
-    console.log(`[Turnstile] Executing: ${cmd}`);
-    
-    const child = spawn("/bin/sh", ["-c", cmd], { cwd: __dirname });
-    let out = "", err = "";
-    
-    child.stdout.on("data", c => out += c.toString());
-    child.stderr.on("data", c => err += c.toString());
-
-    child.on("error", (error) => {
-        callback("error", null, { usr: "ERROR_SPAWN", api: error.message });
-    });
-
-    child.on("close", (code) => {
-        if (code !== 0) return callback("error", null, { usr: "ERROR_CAPTCHA_UNSOLVABLE", api: err || `Exit code ${code}` });
-        const output = out.trim();
-        try {
-            const parsed = JSON.parse(output);
-            if (parsed.token) return callback("ready", { token: parsed.token });
-        } catch (e) {
-            if (output.length > 50) return callback("ready", { token: output });
-        }
-        callback("error", null, { usr: "ERROR_CAPTCHA_UNSOLVABLE", api: output });
-    });
-}
-
-app.get("/", (req, res) => res.json({ status: "ok" }));
-
-app.post("/solve", (req, res) => {
-    const body = req.body;
-    if (body.taskId) {
-        const result = results.get(body.taskId);
-        if (!result) return res.json({ status: "pending", taskId: body.taskId });
-        return res.json({ status: result.status, taskId: body.taskId, solution: result.solution, err: result.err });
-    }
-    if (!body.task || !body.task.websiteURL) return res.status(400).json({ status: "error", err: "BAD_REQUEST" });
-    if (queue.length >= MAX_QUEUE) return res.status(429).json({ status: "error", err: "QUEUE_FULL" });
-
-    const taskId = crypto.randomBytes(6).toString("hex");
-    results.set(taskId, { status: "pending", timestamp: Date.now() });
-    queue.push({ id: taskId, type: body.task.type || "turnstile", data: body.task });
-    res.json({ taskId, status: "pending" });
+    queue.push(taskJob);
     processQueue();
+};
+
+app.post("/solve", solveHandler);
+app.post("/solve/adslab", solveHandler);
+
+app.listen(port, "0.0.0.0", () => {
+    console.log(`🚀 Server berjalan di port ${port}`);
+    console.log(`Profil terdeteksi: ${PROFILES.length}`);
 });
-
-setInterval(() => {
-    const now = Date.now();
-    for (const [id, data] of results.entries()) if (now - data.timestamp > 300000) results.delete(id);
-}, 60000);
-
-app.listen(PORT, () => console.log(`🚀 Server on port ${PORT}`));
