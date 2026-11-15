@@ -74,8 +74,8 @@ class Adslab:
         return token
 
     def _init_captcha(self):
-        # KITA UBAH URL-NYA DI SINI: Gunakan domain utama adslab.me
-        url = "https://adslab.me/v1/alcaptcha/init"
+        # KITA UBAH URL-NYA DI SINI: Gunakan /api/v1/...
+        url = "https://adslab.me/api/v1/alcaptcha/init"
         payload = {
             "sitekey": self.sitekey, "subid": self.subid,
             "domain": self.hostname
@@ -85,8 +85,8 @@ class Adslab:
         return resp.json()
 
     def _verify(self, challenge_id, answers):
-        # KITA UBAH URL-NYA DI SINI: Gunakan domain utama adslab.me
-        url = "https://adslab.me/v1/alcaptcha/verify"
+        # KITA UBAH URL-NYA DI SINI: Gunakan /api/v1/...
+        url = "https://adslab.me/api/v1/alcaptcha/verify"
         payload = {
             "challenge_id": challenge_id, "sitekey": self.sitekey,
             "subid": self.subid, "answers": answers
