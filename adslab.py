@@ -1,4 +1,4 @@
-import json, base64, urllib.parse, hashlib, time
+import json, base64, urllib.parse, hashlib, time, asyncio
 from curl_cffi import requests
 
 try:
@@ -66,18 +66,15 @@ class Adslab:
         expected_len = init_data.get("expectedLength", 3)
         
         img_base64 = None
-        # Ekstrak gambar dari format JSON baru
         if "gifTraps" in init_data and init_data["gifTraps"]:
             img_base64 = init_data["gifTraps"][0]
         elif "base64Traps" in init_data and init_data["base64Traps"]:
             img_base64 = init_data["base64Traps"][0]
         elif "captchaUrl" in init_data:
-            # Jika hanya ada URL, download gambarnya
             url = init_data["captchaUrl"]
             resp = self.session.get(url, headers=self.headers, timeout=30)
             img_base64 = base64.b64encode(resp.content).decode('utf-8')
 
-        # Validasi apakah gambarnya berbentuk dict (kadang AdsLab membungkusnya)
         if isinstance(img_base64, dict):
             img_base64 = img_base64.get("data") or img_base64.get("image")
 
@@ -89,10 +86,11 @@ class Adslab:
             solver = AlcaptchaSolver()
             if "," in img_base64: img_base64 = img_base64.split(",", 1)[1]
             
-            # Panggil OpenCV dengan jumlah gambar dinamis
-            result = solver.solve(img_base64, expected=expected_len)
-            if not result or not result.get("answer") or not result["answer"].get("coord"):
-                raise AdslabError("Gagal mendeteksi koordinat")
+            # PERBAIKAN: Panggil async function menggunakan asyncio.run()
+            result = asyncio.run(solver.solve(img_base64, expected=expected_len))
+            
+            if not isinstance(result, dict) or not result.get("answer") or not result["answer"].get("coord"):
+                raise AdslabError(f"Gagal mendeteksi koordinat: {result}")
                 
             coords_raw = result["answer"]["coord"]
             answers = []
