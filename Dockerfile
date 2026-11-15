@@ -1,5 +1,6 @@
 FROM node:20-slim
 
+# Install system dependencies (Chromium, Python, dll)
 RUN apt-get update && apt-get install -y \
     chromium python3 python3-pip python3-venv \
     fonts-liberation libasound2 libatk-bridge2.0-0 libatk1.0-0 libc6 \
@@ -12,11 +13,15 @@ RUN apt-get update && apt-get install -y \
 
 ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
 ENV CHROME_PATH=/usr/bin/chromium
+ENV VIRTUAL_ENV=/opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
 
 WORKDIR /app
 COPY package*.json ./
 RUN npm install
 
+# Buat venv dan install dependensi Python
+RUN python3 -m venv $VIRTUAL_ENV
 COPY requirements.txt .
 RUN pip3 install --no-cache-dir -r requirements.txt
 
