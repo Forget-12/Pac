@@ -1,216 +1,115 @@
-// app.js — Ubuntu Pr oot (Context Recycl i ng Mode)
-const express  = require("express");
-const { connect } = require("puppeteer-real-browser");
-const crypto   = require("crypto");
-const fs       = require("fs");
-const path     = require("path");
-
-const turnstile    = require("./turnstile");
-const interstitial = require("./interstitial");
+/**
+ * app.js — Universal Captcha Solver API (Railway)
+ */
+const express = require("express");
+const crypto = require("crypto");
+const { spawn } = require("child_process");
+const path = require("path");
+const fs = require("fs");
 
 const app = express();
-const port = process.env.PORT || 7860;
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+app.use(express.json({ limit: "50mb" }));
 
-const MAX_ACTIVE    = parseInt(process.env.MAX_ACTIVE, 10)    || 1;
-const MAX_QUEUE     = parseInt(process.env.MAX_QUEUE, 10)     || 5;
-const QUEUE_TIMEOUT = parseInt(process.env.QUEUE_TIMEOUT, 10) || 60000;
-const TASK_TIMEOUT  = parseInt(process.env.TASK_TIMEOUT, 10)  || 120000;
+const PORT = process.env.PORT || 3000;
+const MAX_ACTIVE = parseInt(process.env.MAX_ACTIVE, 10) || 2;
+const MAX_QUEUE = parseInt(process.env.MAX_QUEUE, 10) || 10;
+const TASK_TIMEOUT = parseInt(process.env.TASK_TIMEOUT, 10) || 120000;
+const CLEANUP_INTERVAL = 60000;
 
-let activeTasks     = 0;
-let browser         = null;
-let browserStarting = null;
-
-const tasks = Object.create(null);
 const queue = [];
-
-// ============================================================
-// BROWSER MANAGEMENT (Sekali Jalan, Context Berkali-kali)
-// ============================================================
-async function init_browser() {
-    if (!browser || !browser.isConnected()) {
-        if (!browserStarting) {
-            console.log("[BROWSER] Meluncurkan Chromium...");
-            browserStarting = connect({
-                headless: false, 
-                turnstile: true,
-                customConfig: {
-                    chromePath: "/usr/bin/chromium",
-                    args: [
-                        '--no-sandbox',
-                        '--disable-gpu',
-                        '--disable-dev-shm-usage',
-                        // 🛠️ Dinaikkan untuk RAM >1GB
-                        '--js-flags="--max-old-space-size=512"',
-                        '--disable-background-networking',
-                        '--disable-component-update',
-                        '--disable-default-apps',
-                        '--disable-extensions',
-                        '--disable-sync'
-                    ]
-                }
-            }).then(ctx => {
-                browser = ctx.browser;
-                console.log("[BROWSER] Chromium berhasil diluncurkan!");
-                browser.on("disconnected", () => {
-                    browser = null;
-                    browserStarting = null;
-                });
-                return browser;
-            }).catch(err => {
-                browserStarting = null;
-                throw new Error("Launch failed: " + err.message);
-            });
-        }
-        await browserStarting;
-    }
-
-    // Buat Context (Incognito) baru yang bersih
-    const context = await browser.createBrowserContext();
-    const page = await context.newPage();
-    
-    // 🛠️ SINKRONISASI TIMEOUT: Harus 120.000 sesuai turnstile.js
-    page.setDefaultNavigationTimeout(120000);
-    page.setDefaultTimeout(120000);
-    
-    return { page, context };
-}
-
-// ============================================================
-// SOLVER TASK (Dengan Context Cleanup)
-// ============================================================
-function withTimeout(factory, ms) {
-    let timer;
-    const timeout = new Promise((_, rej) => {
-        timer = setTimeout(() => rej(new Error("Task timeout")), ms);
-        timer.unref?.();
-    });
-    return Promise.race([factory(), timeout]).finally(() => clearTimeout(timer));
-}
-
-async function executeTask(taskId, data) {
-    let ctx = null;
-    try {
-        ctx = await init_browser();
-        const page = ctx.page;
-
-        let result;
-        if (data.method === "turnstile") {
-            result = await withTimeout(() => turnstile(data, page), TASK_TIMEOUT);
-        } else if (data.method === "interstitial") {
-            result = await withTimeout(() => interstitial(data, page), TASK_TIMEOUT);
-        }
-
-        const solution = {};
-        if (data.method === "turnstile") {
-            solution.token = result.token;
-        } else if (data.method === "interstitial") {
-            solution.cf_clearance = result.solution?.clearance || "";
-            solution.user_agent = result.solution?.user_agent || "";
-        }
-
-        tasks[taskId] = { status: "ready", taskId, solution };
-        setTimeout(() => delete tasks[taskId], 30000).unref?.();
-
-    } catch (err) {
-        console.error(`[Task ${taskId}] Error:`, err.message || err);
-        tasks[taskId] = { status: "error", taskId, err: { usr: "ERROR_CAPTCHA_UNSOLVABLE", api: err.message } };
-        setTimeout(() => delete tasks[taskId], 10000).unref?.();
-    } finally {
-        if (ctx) {
-            try {
-                // 🔥 KUNCI UTAMA: Cukup tutup tab dan context-nya (RAM langsung bersih)
-                if (ctx.page) await ctx.page.close().catch(() => {});
-                if (ctx.context) await ctx.context.close().catch(() => {});
-                console.log(`[Task ${taskId}] Context dibersihkan.`);
-            } catch (e) {}
-        }
-    }
-}
+const activeTasks = new Set();
+const results = new Map();
 
 function processQueue() {
-    while (activeTasks < MAX_ACTIVE && queue.length > 0) {
-        const taskId = queue.shift();
-        const task   = tasks[taskId];
-        if (!task || task.status !== "pending") continue;
-        if (task.queueTimer) { clearTimeout(task.queueTimer); task.queueTimer = null; }
-        
-        activeTasks++;
-        task.status = "processing";
-        executeTask(taskId, task.data).finally(() => {
-            activeTasks--;
-            setImmediate(processQueue);
-        });
-    }
+    if (activeTasks.size >= MAX_ACTIVE || queue.length === 0) return;
+    const task = queue.shift();
+    activeTasks.add(task.id);
+
+    const timeoutTimer = setTimeout(() => {
+        if (activeTasks.has(task.id)) {
+            activeTasks.delete(task.id);
+            results.set(task.id, { status: "error", err: { usr: "ERROR_TIMEOUT", api: "Task timeout exceeded" }, timestamp: Date.now() });
+            processQueue();
+        }
+    }, TASK_TIMEOUT);
+
+    const cleanup = (status, solution = null, err = null) => {
+        clearTimeout(timeoutTimer);
+        if (!activeTasks.has(task.id)) return;
+        activeTasks.delete(task.id);
+        results.set(task.id, { status, solution, err, timestamp: Date.now() });
+        processQueue();
+    };
+
+    if (task.type === "AdsLabTask") runAdslab(task.data, cleanup);
+    else runTurnstile(task.data, cleanup);
 }
 
-// ============================================================
-// AUTO-CLEANUP (Pembersih Storage Berkala)
-// ============================================================
-setInterval(() => {
-    try {
-        const targetDirs = ["/tmp", "/root/.cache"];
-        let removed = 0;
-        for (const dir of targetDirs) {
-            if (!fs.existsSync(dir)) continue;
-            for (const entry of fs.readdirSync(dir)) {
-                // Hapus folder cache Chromium sisa task sebelumnya
-                if (entry.startsWith("puppeteer_dev_") || entry.startsWith(".org.chromium.Chromium")) {
-                    fs.rmSync(path.join(dir, entry), { recursive: true, force: true });
-                    removed++;
-                }
-            }
+function runAdslab(data, callback) {
+    console.log(`[AdsLab] Memulai task...`);
+    const py = spawn("python3", ["adslab_runner.py"], { cwd: __dirname, stdio: ["pipe", "pipe", "pipe"] });
+    let stdoutData = "", stderrData = "";
+    py.stdout.on("data", (c) => stdoutData += c.toString());
+    py.stderr.on("data", (c) => stderrData += c.toString());
+    py.on("close", (code) => {
+        if (code !== 0 || !stdoutData.trim()) return callback("error", null, { usr: "ERROR_CAPTCHA_UNSOLVABLE", api: stderrData });
+        try {
+            const parsed = JSON.parse(stdoutData.trim().split("\n").pop());
+            if (parsed.ok && parsed.token) callback("ready", { token: parsed.token });
+            else callback("error", null, { usr: "ERROR_CAPTCHA_UNSOLVABLE", api: parsed.error });
+        } catch (e) {
+            callback("error", null, { usr: "ERROR_PARSE", api: "Invalid JSON" });
         }
-        if (removed > 0) console.log(`[CLEANUP] Membersihkan ${removed} folder sisa di storage.`);
-    } catch (e) {}
-}, 300000).unref?.(); // Jalan setiap 5 menit
+    });
+    py.stdin.write(JSON.stringify({ task: data }) + "\n");
+    py.stdin.end();
+}
 
-// ============================================================
-// ROUTES
-// ============================================================
-app.get("/", (req, res) => res.status(200).json({ 
-    status: "ok", 
-    browserAlive: !!(browser && browser.isConnected()),
-    active: activeTasks,
-    queue: queue.length,
-    ramMB: Math.round(process.memoryUsage().rss / 1024 / 1024)
-}));
+function runTurnstile(data, callback) {
+    console.log(`[Turnstile] Memulai task...`);
+    const binPath = path.join(__dirname, "cfsolve");
+    if (!fs.existsSync(binPath)) return callback("error", null, { usr: "ERROR_SETUP", api: "cfsolve not found" });
+    const args = [data.websiteURL, data.websiteKey || ""];
+    if (data.proxy) args.push("--proxy", data.proxy);
+    const child = spawn(binPath, args, { cwd: __dirname });
+    let stdoutData = "", stderrData = "";
+    child.stdout.on("data", (c) => stdoutData += c.toString());
+    child.stderr.on("data", (c) => stderrData += c.toString());
+    child.on("close", (code) => {
+        if (code !== 0) return callback("error", null, { usr: "ERROR_CAPTCHA_UNSOLVABLE", api: stderrData });
+        const output = stdoutData.trim();
+        try {
+            const parsed = JSON.parse(output);
+            if (parsed.token) return callback("ready", { token: parsed.token });
+        } catch (e) {
+            if (output.length > 50) return callback("ready", { token: output });
+        }
+        callback("error", null, { usr: "ERROR_CAPTCHA_UNSOLVABLE", api: output });
+    });
+}
 
-app.post("/solve", async (req, res) => {
+app.get("/", (req, res) => res.json({ status: "ok" }));
+
+app.post("/solve", (req, res) => {
     const body = req.body;
     if (body.taskId) {
-        const existingTask = tasks[body.taskId];
-        if (!existingTask) return res.status(200).json({ status: "error", err: { usr: "TASK_NOT_FOUND" } });
-        if (existingTask.status !== "pending" && existingTask.status !== "processing") delete tasks[body.taskId];
-        return res.status(200).json(existingTask);
+        const result = results.get(body.taskId);
+        if (!result) return res.json({ status: "pending", taskId: body.taskId });
+        return res.json({ status: result.status, taskId: body.taskId, solution: result.solution, err: result.err });
     }
+    if (!body.task || !body.task.websiteURL) return res.status(400).json({ status: "error", err: "BAD_REQUEST" });
+    if (queue.length >= MAX_QUEUE) return res.status(429).json({ status: "error", err: "QUEUE_FULL" });
 
-    if (body.method !== "CloudflareTask" || typeof body.task !== "object") {
-        return res.status(400).json({ status: "error", err: { usr: "BAD_PARAMETERS" } });
-    }
-
-    if (queue.length >= MAX_QUEUE) return res.status(429).json({ status: "error", err: { usr: "QUEUE_FULL" } });
-
-    const newTaskId = crypto.randomUUID().replace(/-/g, "").slice(0, 12);
-    tasks[newTaskId] = { status: "pending", taskId: newTaskId, data: {
-        method: (body.task.type || "").toLowerCase(),
-        domain: body.task.websiteUrl,
-        siteKey: body.task.websiteKey,
-        action: body.task.action,
-        cdata: body.task.cdata,
-        pagedata: body.task.pdata,
-        payload: body.task.payload
-    }};
-    
-    queue.push(newTaskId);
+    const taskId = crypto.randomBytes(6).toString("hex");
+    results.set(taskId, { status: "pending", timestamp: Date.now() });
+    queue.push({ id: taskId, type: body.task.type || "turnstile", data: body.task });
+    res.json({ taskId, status: "pending" });
     processQueue();
-    res.status(202).json({ taskId: newTaskId, status: "pending" });
 });
 
-app.listen(port, "0.0.0.0", () => {
-    console.log(`====================================`);
-    console.log(`Server Proot berjalan di port ${port}`);
-    console.log(`Context Recycling Mode: AKTIF`);
-    console.log(`====================================`);
-});
+setInterval(() => {
+    const now = Date.now();
+    for (const [id, data] of results.entries()) if (now - data.timestamp > 300000) results.delete(id);
+}, CLEANUP_INTERVAL);
+
+app.listen(PORT, () => console.log(`🚀 Server on port ${PORT}`));
