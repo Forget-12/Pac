@@ -80,31 +80,40 @@ function runCfWaf(data, callback) {
 
 function runTurnstile(data, callback) {
     console.log(`[Turnstile] Memulai task...`);
-    const binPath = path.join(__dirname, "cfsolve");
+    let binPath = path.join(__dirname, "cfsolve");
     
-    if (!fs.existsSync(binPath)) {
-        return callback("error", null, { usr: "ERROR_SETUP", api: "cfsolve missing" });
+    // Deteksi jika cfsolve ternyata berupa folder
+    if (fs.existsSync(binPath) && fs.statSync(binPath).isDirectory()) {
+        console.log(`[Turnstile] Peringatan: cfsolve adalah folder, mencari file di dalamnya...`);
+        binPath = path.join(binPath, "cfsolve");
     }
 
-    // Paksa file agar bisa dieksekusi (mengatasi EACCES)
-    try { fs.chmodSync(binPath, '755'); } catch (e) { console.error("Chmod error:", e.message); }
+    if (!fs.existsSync(binPath)) {
+        return callback("error", null, { usr: "ERROR_SETUP", api: "cfsolve binary missing" });
+    }
 
-    const args = [data.websiteURL, data.websiteKey || ""];
-    if (data.proxy) args.push("--proxy", data.proxy);
+    // Paksa permission 755
+    try { fs.chmodSync(binPath, 0o755); } catch (e) { console.error("Chmod error:", e.message); }
+
+    const args = [`"${data.websiteURL}"`, `"${data.websiteKey || ""}"`];
+    if (data.proxy) args.push("--proxy", `"${data.proxy}"`);
     
-    const child = spawn(binPath, args, { cwd: __dirname });
+    // Gunakan sh -c agar terhindar dari EACCES Node.js
+    const cmd = `"${binPath}" ${args.join(' ')}`;
+    console.log(`[Turnstile] Executing: ${cmd}`);
+    
+    const child = spawn("/bin/sh", ["-c", cmd], { cwd: __dirname });
     let out = "", err = "";
     
     child.stdout.on("data", c => out += c.toString());
     child.stderr.on("data", c => err += c.toString());
 
-    // TANGKAP ERROR SPAWN AGAR SERVER TIDAK CRASH
     child.on("error", (error) => {
         callback("error", null, { usr: "ERROR_SPAWN", api: error.message });
     });
 
     child.on("close", (code) => {
-        if (code !== 0) return callback("error", null, { usr: "ERROR_CAPTCHA_UNSOLVABLE", api: err });
+        if (code !== 0) return callback("error", null, { usr: "ERROR_CAPTCHA_UNSOLVABLE", api: err || `Exit code ${code}` });
         const output = out.trim();
         try {
             const parsed = JSON.parse(output);
