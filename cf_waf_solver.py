@@ -6,8 +6,8 @@ def check_cf(html, status):
     if html and any(m in html.lower() for m in ["just a moment", "cf-challenge", "attention required"]): return True
     return False
 
-def call_hard_solver(url, proxy):
-    payload = json.dumps({"url": url, "proxy": proxy})
+def call_hard_solver(url, proxy, ua):
+    payload = json.dumps({"url": url, "proxy": proxy, "ua": ua})
     try:
         p = subprocess.Popen(["node", "cf_hard_solver.js"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         out, err = p.communicate(input=payload, timeout=90)
@@ -15,10 +15,11 @@ def call_hard_solver(url, proxy):
     except Exception as e:
         return {"ok": False, "error": f"Hard solver error: {str(e)}"}
 
-def solve_waf(url, proxy=None, cookies=None):
+def solve_waf(url, proxy=None, cookies=None, ua=None):
     session = requests.Session(impersonate="safari15_5")
     if proxy: session.proxies = {"http": proxy, "https": proxy}
     if cookies: session.cookies.update(cookies)
+    if ua: session.headers["User-Agent"] = ua
 
     try:
         r = session.get(url, timeout=30, allow_redirects=True)
@@ -37,7 +38,7 @@ def solve_waf(url, proxy=None, cookies=None):
             return {"ok": True, "token": cf2, "ua": session.headers.get("User-Agent"), "type": "soft"}
 
         print("[WAF] Gagal. Beralih ke Hard Solver...", file=sys.stderr)
-        hard_res = call_hard_solver(url, proxy)
+        hard_res = call_hard_solver(url, proxy, ua)
         if hard_res.get("ok"):
             hard_res["type"] = "hard"
             return hard_res
@@ -53,7 +54,7 @@ if __name__ == "__main__":
         task = data.get("task", {})
         c_str = task.get("cookies", "")
         cookies = {c.split("=")[0].strip(): c.split("=")[1].strip() for c in c_str.split(";") if "=" in c}
-        res = solve_waf(task.get("websiteURL"), task.get("proxy"), cookies)
+        res = solve_waf(task.get("websiteURL"), task.get("proxy"), cookies, task.get("ua"))
         
         # PASTIKAN HANYA MENGELUARKAN JSON
         print(json.dumps(res))

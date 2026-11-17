@@ -1,18 +1,20 @@
 # ==========================================
-# TAHAP 1: BUILDER CFSOLVE (Rust)
+# TAHAP 1: BUILDER CFSOLVE (Rust) — dari cfsolve.zip bundled
 # ==========================================
-FROM rust:1.75-bookworm AS cfsolve-builder
+FROM rust:bookworm AS cfsolve-builder
 
-# Instal dependensi yang dibutuhkan untuk compile BoringSSL & cfsolve
+# Dependensi compile BoringSSL & cfsolve
 RUN apt-get update && apt-get install -y \
-    cmake clang libclang-dev git pkg-config libssl-dev build-essential golang-go \
+    cmake clang libclang-dev pkg-config libssl-dev build-essential \
+    golang-go git unzip \
     && rm -rf /var/lib/apt/lists/*
 
-# Clone repositori cfsolve
-RUN git clone https://github.com/chris124567/cfsolve.git /tmp/cfsolve
-WORKDIR /tmp/cfsolve
+# Build dari arsip yang dibawa repo (self-contained, versi terpin)
+COPY cfsolve.zip /tmp/cfsolve.zip
+RUN unzip -q /tmp/cfsolve.zip -d /src
 
-# Build binary 'challenge'
+WORKDIR /src/cfsolve
+# rust-toolchain.toml di dalam zip memilih channel terpin; rustup memasangnya.
 RUN cargo build --release --bin challenge
 
 # ==========================================
@@ -39,7 +41,7 @@ WORKDIR /app
 COPY package*.json ./
 RUN npm install
 
-# Buat Virtual Environment Python
+# Virtual Environment Python
 RUN python3 -m venv $VIRTUAL_ENV
 
 COPY requirements.txt .
@@ -47,11 +49,11 @@ RUN pip3 install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-# --- SALIN BINARY CFSOLVE DARI TAHAP 1 ---
-COPY --from=cfsolve-builder /tmp/cfsolve/target/release/challenge /app/cfsolve
+# --- BINARY CFSOLVE HASIL BUILD DARI ZIP ---
+COPY --from=cfsolve-builder /src/cfsolve/target/release/challenge /app/cfsolve
 RUN chmod +x /app/cfsolve
 
-# Ekstrak profiles.zip jika masih diperlukan untuk rotasi profil
+# Ekstrak profil perangkat (iphone-*) untuk rotasi --fingerprint
 RUN unzip -o profiles.zip -d profiles || true
 
 CMD ["node", "app.js"]

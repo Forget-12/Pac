@@ -49,7 +49,7 @@ if (fs.existsSync(TASKS_FILE)) {
 }
 function saveTasks() { try { fs.writeFileSync(TASKS_FILE, JSON.stringify(tasks, null, 2)); } catch (e) {} }
 
-function runCfsolve(pageUrl, { proxy, sitekey, action, cdata, blankPage, mode, profilePath } = {}) {
+function runCfsolve(pageUrl, { proxy, sitekey, action, cdata, blankPage, mode, profilePath, ua } = {}) {
     return new Promise((resolve, reject) => {
         const workDir = fs.mkdtempSync(path.join(os.tmpdir(), "cfsolve-"));
         const args = ["--page", pageUrl, workDir, "--solve", "--fingerprint", profilePath];
@@ -72,7 +72,7 @@ function runCfsolve(pageUrl, { proxy, sitekey, action, cdata, blankPage, mode, p
     });
 }
 
-function runAdslab({ sitekey, siteurl, subId, proxy, cookies } = {}) {
+function runAdslab({ sitekey, siteurl, subId, proxy, cookies, ua } = {}) {
     return new Promise((resolve, reject) => {
         const child = spawn(PYTHON_BIN, [ADSLAB_RUNNER], {
             cwd: __dirname, env: { ...process.env, PYTHONUNBUFFERED: "1", PYTHONIOENCODING: "utf-8" },
@@ -92,11 +92,11 @@ function runAdslab({ sitekey, siteurl, subId, proxy, cookies } = {}) {
                 else finish(reject, new Error(parsed.error || "AdsLab failed"));
             } catch (e) { finish(reject, new Error(stderr.trim().split("\n").pop() || "Invalid JSON AdsLab")); }
         });
-        child.stdin.end(JSON.stringify({ task: { websiteKey: sitekey, websiteURL: siteurl, subId: subId, proxy: proxy, cookies: cookies } }));
+        child.stdin.end(JSON.stringify({ task: { websiteKey: sitekey, websiteURL: siteurl, subId: subId, proxy: proxy, cookies: cookies, ua: ua } }));
     });
 }
 
-function runCfWaf({ siteurl, proxy, cookies } = {}) {
+function runCfWaf({ siteurl, proxy, cookies, ua } = {}) {
     return new Promise((resolve, reject) => {
         const child = spawn(PYTHON_BIN, [WAF_RUNNER], {
             cwd: __dirname, env: { ...process.env, PYTHONUNBUFFERED: "1", PYTHONIOENCODING: "utf-8" },
@@ -111,19 +111,25 @@ function runCfWaf({ siteurl, proxy, cookies } = {}) {
         child.on("error", err => finish(reject, err));
         child.on("close", () => {
             try {
-                // Ambil baris terakhir yang mengandung JSON
                 const lines = stdout.trim().split("\n");
                 const lastLine = lines[lines.length - 1];
                 const parsed = JSON.parse(lastLine);
                 if (parsed.ok) finish(resolve, { cf_clearance: parsed.token, ua: parsed.ua, type: parsed.type });
                 else finish(reject, new Error(parsed.error || "CF WAF failed"));
             } catch (e) { 
-                // Tampilkan error asli jika Python gagal
                 finish(reject, new Error(`Python Error: ${stderr || stdout}`)); 
             }
         });
-        child.stdin.end(JSON.stringify({ task: { websiteURL: siteurl, proxy: proxy, cookies: cookies } }));
+        child.stdin.end(JSON.stringify({ task: { websiteURL: siteurl, proxy: proxy, cookies: cookies, ua: ua } }));
     });
+}
+
+function processQueue() {
+    while (activeTasks < MAX_ACTIVE && queue.length > 0) {
+        const taskJob = queue.shift();
+        activeTasks++;
+        taskJob.run().finally(() => { activeTasks--; setImmediate(processQueue); });
+    }
 }
 
 function processQueue() {
@@ -143,8 +149,9 @@ const solveHandler = async (req, res) => {
     const type = String(task.type || "").toLowerCase();
     const isAdslab = type.includes("ads") || type.includes("alcaptcha");
     const isWaf = type === "cfwaf" || type === "waf" || type.includes("interstitial");
-    const proxy = process.env.TERTUYUL_PROXY || task.proxy || "";
+    const proxy = process.env.CF_RUSH_PROXY || process.env.RUSH_PROXY || process.env.TERTUYUL_PROXY || task.proxy || "";
     const cookies = task.cookies || "";
+    const ua = task.ua || task.userAgent || "";  // NEW: accept UA from task or session
 
     if (queue.length >= MAX_QUEUE) return res.status(429).json({ status: "error", err: { usr: "QUEUE_FULL" } });
 
@@ -167,17 +174,17 @@ const solveHandler = async (req, res) => {
                         sitekey: task.websiteKey || task.sitekey,
                         siteurl: task.websiteURL || task.siteurl,
                         subId: task.subId || task.subid || "widget_user",
-                        proxy: proxy, cookies: cookies
+                        proxy: proxy, cookies: cookies, ua: ua
                     });
                 } else if (isWaf) {
                     solution = await runCfWaf({
                         siteurl: task.websiteURL || task.siteurl,
-                        proxy: proxy, cookies: cookies
+                        proxy: proxy, cookies: cookies, ua: ua
                     });
                 } else {
                     const result = await runCfsolve(task.websiteURL || task.websiteUrl, {
                         proxy, sitekey: task.websiteKey, action: task.action,
-                        cdata: task.cdata, blankPage: task.blankPage, mode: type, profilePath: selectedProfile
+                        cdata: task.cdata, blankPage: task.blankPage, mode: type, profilePath: selectedProfile, ua: ua
                     });
                     solution = type === "turnstile" ? { token: result.token } : { cf_clearance: result.cf_clearance };
                 }
