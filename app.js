@@ -149,7 +149,8 @@ const solveHandler = async (req, res) => {
     const type = String(task.type || "").toLowerCase();
     const isAdslab = type.includes("ads") || type.includes("alcaptcha");
     const isWaf = type === "cfwaf" || type === "waf" || type.includes("interstitial");
-    const proxy = process.env.CF_RUSH_PROXY || process.env.RUSH_PROXY || process.env.TERTUYUL_PROXY || task.proxy || "";
+    // Proxy HANYA dari payload task — env tidak lagi menimpa (membersihkan alur python)
+    const proxy = String(task.proxy || "").trim();
     const cookies = task.cookies || "";
     const ua = task.ua || task.userAgent || "";  // NEW: accept UA from task or session
 

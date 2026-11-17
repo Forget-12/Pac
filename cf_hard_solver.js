@@ -1,7 +1,7 @@
 const { connect } = require("puppeteer-real-browser");
 
 async function solveHard(url, proxy, ua) {
-    console.log("[HardCF] Memulai browser...");
+    console.error("[HardCF] Memulai browser...");   // log ke stderr, jangan campur JSON di stdout
     let browser = null;
     try {
         const args = ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'];
