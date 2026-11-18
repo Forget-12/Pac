@@ -49,11 +49,11 @@ if (fs.existsSync(TASKS_FILE)) {
 }
 function saveTasks() { try { fs.writeFileSync(TASKS_FILE, JSON.stringify(tasks, null, 2)); } catch (e) {} }
 
-function runCfsolve(pageUrl, { proxy, sitekey, action, cdata, blankPage, mode, profilePath, ua } = {}) {
+function runCfsolve(pageUrl, { proxy, sitekey, action, cdata, blankPage, mode, profilePath, ua, timeoutMs } = {}) {
     return new Promise((resolve, reject) => {
         const workDir = fs.mkdtempSync(path.join(os.tmpdir(), "cfsolve-"));
         const args = ["--page", pageUrl, workDir, "--solve", "--fingerprint", profilePath];
-        
+
         if (proxy) args.push("--proxy", proxy);
         if (mode === "turnstile" && sitekey) {
             args.push("--sitekey", sitekey);
@@ -61,13 +61,31 @@ function runCfsolve(pageUrl, { proxy, sitekey, action, cdata, blankPage, mode, p
             if (action) args.push("--action", action);
             if (cdata) args.push("--cdata", cdata);
         }
-        
-        execFile(CFSOLVE_BIN, args, { timeout: TASK_TIMEOUT }, (err, stdout, stderr) => {
+
+        execFile(CFSOLVE_BIN, args, { timeout: timeoutMs || TASK_TIMEOUT, maxBuffer: 1024 * 1024 }, (err, stdout, stderr) => {
             try { fs.rmSync(workDir, { recursive: true, force: true }); } catch {}
-            if (err) return reject(new Error((stderr || err.message || "").toString().trim().split('\n').pop()));
-            const out = (stdout || "").trim();
-            if (out.startsWith("cf_clearance=")) return resolve({ cf_clearance: out.split("=")[1] });
-            return resolve({ token: out });
+
+            const rawStdout = (stdout || "").toString().trim();
+            const rawStderr = (stderr || "").toString().trim();
+            if (err) {
+                const rawErr = (rawStderr || rawStdout || err.message || "cfsolve failed").toString();
+                const lines = rawErr.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+                let shortErr = lines.length ? lines[lines.length - 1] : "cfsolve failed";
+                if (shortErr.includes("VM: function")) {
+                    shortErr = lines.find(l => l && !l.includes("VM: function")) || "Gagal menyelesaikan (CF Error)";
+                }
+                const detail = lines.slice(-3).join(" | ").slice(0, 350);
+                return reject(new Error(detail || shortErr));
+            }
+
+            const out = rawStdout;
+            if (!out) return reject(new Error(rawStderr ? rawStderr.split(/\r?\n/).pop().slice(0, 350) : "Empty output dari cfsolve"));
+
+            const lines = out.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+            const cfLine = [...lines].reverse().find(l => l.startsWith("cf_clearance="));
+            if (cfLine) return resolve({ cf_clearance: cfLine.split("=", 2)[1].trim() });
+            if (out.startsWith("cf_clearance=")) return resolve({ cf_clearance: out.split("=", 2)[1].trim() });
+            return resolve({ token: lines.length ? lines[lines.length - 1] : out });
         });
     });
 }
@@ -132,14 +150,6 @@ function processQueue() {
     }
 }
 
-function processQueue() {
-    while (activeTasks < MAX_ACTIVE && queue.length > 0) {
-        const taskJob = queue.shift();
-        activeTasks++;
-        taskJob.run().finally(() => { activeTasks--; setImmediate(processQueue); });
-    }
-}
-
 const solveHandler = async (req, res) => {
     const body = req.body || {};
     if (body.taskId && tasks[body.taskId]) return res.json(tasks[body.taskId]);
@@ -153,8 +163,11 @@ const solveHandler = async (req, res) => {
     const proxy = String(task.proxy || "").trim();
     const cookies = task.cookies || "";
     const ua = task.ua || task.userAgent || "";  // NEW: accept UA from task or session
+    const websiteUrl = task.websiteURL || task.websiteUrl || task.siteurl || task.pageUrl || task.url || "";
+    const timeoutMs = Math.max(30000, parseInt(task.timeout || process.env.TASK_TIMEOUT || TASK_TIMEOUT, 10) || TASK_TIMEOUT);
 
     if (queue.length >= MAX_QUEUE) return res.status(429).json({ status: "error", err: { usr: "QUEUE_FULL" } });
+    if (!websiteUrl) return res.status(400).json({ status: "error", error: "Missing websiteUrl", err: { usr: "ERROR_BAD_PARAMETERS" } });
 
     const taskId = crypto.randomUUID().replace(/-/g, "").slice(0, 12);
     const selectedProfile = (isAdslab || isWaf) ? null : getNextProfile();
@@ -162,9 +175,9 @@ const solveHandler = async (req, res) => {
 
     tasks[taskId] = { status: "pending", taskId };
     saveTasks();
-    
+
     res.json({ taskId, status: "pending" });
-    console.log(`[TASK] ${taskId} masuk antrean. Tipe: ${profileName}`);
+    console.log(`[TASK] ${taskId} masuk antrean. Tipe: ${profileName} type=${type || "cf"} url=${websiteUrl}`);
 
     const taskJob = {
         run: async () => {
@@ -173,27 +186,35 @@ const solveHandler = async (req, res) => {
                 if (isAdslab) {
                     solution = await runAdslab({
                         sitekey: task.websiteKey || task.sitekey,
-                        siteurl: task.websiteURL || task.siteurl,
+                        siteurl: websiteUrl,
                         subId: task.subId || task.subid || "widget_user",
                         proxy: proxy, cookies: cookies, ua: ua
                     });
                 } else if (isWaf) {
                     solution = await runCfWaf({
-                        siteurl: task.websiteURL || task.siteurl,
+                        siteurl: websiteUrl,
                         proxy: proxy, cookies: cookies, ua: ua
                     });
                 } else {
-                    const result = await runCfsolve(task.websiteURL || task.websiteUrl, {
-                        proxy, sitekey: task.websiteKey, action: task.action,
-                        cdata: task.cdata, blankPage: task.blankPage, mode: type, profilePath: selectedProfile, ua: ua
+                    const result = await runCfsolve(websiteUrl, {
+                        proxy, sitekey: task.websiteKey || task.sitekey, action: task.action,
+                        cdata: task.cdata, blankPage: task.blankPage, mode: type, profilePath: selectedProfile, ua: ua, timeoutMs
                     });
-                    solution = type === "turnstile" ? { token: result.token } : { cf_clearance: result.cf_clearance };
+                    if (type === "turnstile") {
+                        if (!result || !result.token) throw new Error("cfsolve returned no turnstile token");
+                        solution = { token: result.token };
+                    } else {
+                        if (!result || !result.cf_clearance) {
+                            throw new Error(result && result.token ? `unexpected cfsolve output: ${String(result.token).slice(0, 220)}` : "cfsolve returned no cf_clearance");
+                        }
+                        solution = { cf_clearance: result.cf_clearance, profile: profileName };
+                    }
                 }
                 tasks[taskId] = { status: "ready", taskId, solution };
-                console.log(`[SUKSES] Task ${taskId} selesai (${type})`);
+                console.log(`[SUKSES] Task ${taskId} selesai (${type || profileName})`);
             } catch (err) {
                 tasks[taskId] = { status: "error", taskId, err: { usr: "ERROR_CAPTCHA_UNSOLVABLE", api: err.message } };
-                console.log(`[GAGAL] Task ${taskId} (${type}): ${err.message}`);
+                console.log(`[GAGAL] Task ${taskId} (${type || profileName}): ${err.message}`);
             } finally {
                 saveTasks();
                 setTimeout(() => { delete tasks[taskId]; saveTasks(); }, 60000);
