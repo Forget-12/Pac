@@ -29,7 +29,7 @@ let PROFILES = [];
 function _loadProfiles(dir) {
     try {
         const dirs = fs.readdirSync(dir, { withFileTypes: true })
-            .filter(dirent => dirent.isDirectory()).map(dirent => dirent.name);
+            .filter(dirent => dirent.isDirectory()).map(dirent => dirent.name).sort();
         for (const d of dirs) {
             const mainJsonPath = path.join(dir, d, "main.json");
             if (fs.existsSync(mainJsonPath)) PROFILES.push(mainJsonPath);
@@ -41,7 +41,19 @@ if (PROFILES.length === 0) _loadProfiles(path.join(__dirname, "profiles"));
 if (PROFILES.length === 0) {
     console.error("Gagal baca profil: tidak ada profile valid di", PROFILES_DIR, "atau ./profiles");
     PROFILES.push(path.join(__dirname, "profiles", "iphone-13", "main.json"));
-} 
+}
+
+// WAF: prioritaskan profil yang cenderung lebih kompatibel dengan challenge saat ini.
+// (probe/collector dapat berubah; urutan ini bisa diperbarui setelah capture profil baru)
+const WAF_PROFILES = [...PROFILES].sort((a, b) => {
+    const score = (p) => {
+        const n = path.basename(path.dirname(p)).toLowerCase();
+        if (n.includes("iphone-13") || n.includes("iphone-14")) return 0;
+        if (n.includes("safari") || n.includes("chrome")) return 1;
+        return 2;
+    };
+    return score(a) - score(b);
+});
 
 let profileIndex = 0;
 let wafProfileIndex = 0;
@@ -51,8 +63,9 @@ function getNextProfile() {
     return prof;
 }
 function getNextWafProfile() {
-    const prof = PROFILES[wafProfileIndex];
-    wafProfileIndex = (wafProfileIndex + 1) % PROFILES.length;
+    const list = WAF_PROFILES.length ? WAF_PROFILES : PROFILES;
+    const prof = list[wafProfileIndex % list.length];
+    wafProfileIndex = (wafProfileIndex + 1) % list.length;
     return prof;
 }
 
