@@ -48,9 +48,10 @@ if (PROFILES.length === 0) {
 const WAF_PROFILES = [...PROFILES].sort((a, b) => {
     const score = (p) => {
         const n = path.basename(path.dirname(p)).toLowerCase();
-        if (n.includes("iphone-13") || n.includes("iphone-14")) return 0;
-        if (n.includes("safari") || n.includes("chrome")) return 1;
-        return 2;
+        if (n.includes("safari-26")) return 0;
+        if (n.includes("iphone-13") || n.includes("iphone-14")) return 1;
+        if (n.includes("safari") || n.includes("chrome")) return 2;
+        return 3;
     };
     return score(a) - score(b);
 });
