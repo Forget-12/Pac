@@ -292,7 +292,14 @@ const solveHandler = async (req, res) => {
                                 throw new Error(result && result.token ? `unexpected cfsolve output: ${String(result.token).slice(0, 220)}` : "cfsolve returned no cf_clearance");
                             } catch (e) {
                                 wafPrimaryErr = e;
-                                console.log(`[WAF] cfsolve attempt ${attempt + 1}/${maxAttempts} (${wafProfileName}) gagal: ${redactSecrets(e.message, [proxy])}`);
+                                const emsg = redactSecrets(e.message, [proxy]);
+                                console.log(`[WAF] cfsolve attempt ${attempt + 1}/${maxAttempts} (${wafProfileName}) gagal: ${emsg}`);
+                                const raw = String(e.message || e || "");
+                                const proxyConnectErr = /tunnel error|failed to create underlying connection|tcp connect error|failed to connect to proxy|proxy connect|connection refused|network is unreachable|no route to host|host unreachable|os error 11[013]|os error 101/i.test(raw);
+                                if (proxyConnectErr) {
+                                    console.log(`[WAF] proxy/connectivity error terdeteksi; hentikan rotasi profil`);
+                                    break;
+                                }
                             }
                         }
                     }
