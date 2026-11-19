@@ -1,4 +1,4 @@
-import sys, json, time, subprocess
+import sys, json, time, subprocess, os
 from curl_cffi import requests
 
 def check_cf(html, status):
@@ -9,9 +9,13 @@ def check_cf(html, status):
 def call_hard_solver(url, proxy, ua):
     payload = json.dumps({"url": url, "proxy": proxy, "ua": ua})
     try:
-        p = subprocess.Popen(["node", "cf_hard_solver.js"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cf_hard_solver.js")
+        p = subprocess.Popen(["node", script], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         out, err = p.communicate(input=payload, timeout=90)
-        return json.loads(out.strip())
+        text = (out or "").strip()
+        if not text:
+            return {"ok": False, "error": f"Hard solver empty output: {(err or '').strip()[:300]}"}
+        return json.loads(text)
     except Exception as e:
         return {"ok": False, "error": f"Hard solver error: {str(e)}"}
 

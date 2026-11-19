@@ -18,8 +18,21 @@ async function solveHard(url, proxy, ua) {
         const page = await browser.newPage();
 
         if (proxy) {
-            const auth = proxy.split('@')[0].split('//')[1].split(':');
-            await page.authenticate({ username: auth[0], password: auth[1] });
+            try {
+                let p = String(proxy);
+                if (!/^[a-zA-Z]+:\/\//.test(p)) p = 'http://' + p;
+                const u = new URL(p);
+                if (u.username || u.password) {
+                    await page.authenticate({
+                        username: decodeURIComponent(u.username || ''),
+                        password: decodeURIComponent(u.password || '')
+                    });
+                }
+                // best-effort: pass proxy server arg if possible
+                // (puppeteer-real-browser may handle differently; kept minimal)
+            } catch (e) {
+                console.log('[HardCF] proxy parse warning: ' + e.message);
+            }
         }
 
         if (ua) await page.setUserAgent(ua);

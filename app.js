@@ -10,10 +10,10 @@ const port = process.env.PORT || 3000;
 app.use(express.json({ limit: "50mb" }));
 
 // Gunakan /app/cfsolve (sesuai Dockerfile baru)
-const CFSOLVE_BIN = process.env.CFSOLVE_BIN || "/app/cfsolve"; 
+const CFSOLVE_BIN = process.env.CFSOLVE_BIN || (fs.existsSync(path.join(__dirname, "cfsolve")) ? path.join(__dirname, "cfsolve") : "/app/cfsolve");
 const TASK_TIMEOUT = parseInt(process.env.TASK_TIMEOUT, 10) || 120000;
 const TASKS_FILE = path.join(os.tmpdir(), "tasks.json");
-const PROFILES_DIR = "/app/profiles";
+const PROFILES_DIR = process.env.PROFILES_DIR || "/app/profiles";
 
 const PYTHON_BIN = process.env.PYTHON_BIN || "python3";
 const ADSLAB_RUNNER = path.join(__dirname, "adslab_runner.py");
@@ -26,15 +26,22 @@ let activeTasks = 0;
 const queue = [];
 
 let PROFILES = [];
-try {
-    const dirs = fs.readdirSync(PROFILES_DIR, { withFileTypes: true })
-        .filter(dirent => dirent.isDirectory()).map(dirent => dirent.name);
-    for (const dir of dirs) {
-        const mainJsonPath = path.join(PROFILES_DIR, dir, "main.json");
-        if (fs.existsSync(mainJsonPath)) PROFILES.push(mainJsonPath);
-    }
-} catch (e) { console.error("Gagal baca profil:", e.message); }
-if (PROFILES.length === 0) PROFILES.push("/app/profiles/iphone-13/main.json"); 
+function _loadProfiles(dir) {
+    try {
+        const dirs = fs.readdirSync(dir, { withFileTypes: true })
+            .filter(dirent => dirent.isDirectory()).map(dirent => dirent.name);
+        for (const d of dirs) {
+            const mainJsonPath = path.join(dir, d, "main.json");
+            if (fs.existsSync(mainJsonPath)) PROFILES.push(mainJsonPath);
+        }
+    } catch (e) { /* ignore */ }
+}
+_loadProfiles(PROFILES_DIR);
+if (PROFILES.length === 0) _loadProfiles(path.join(__dirname, "profiles"));
+if (PROFILES.length === 0) {
+    console.error("Gagal baca profil: tidak ada profile valid di", PROFILES_DIR, "atau ./profiles");
+    PROFILES.push(path.join(__dirname, "profiles", "iphone-13", "main.json"));
+} 
 
 let profileIndex = 0;
 function getNextProfile() {
@@ -157,8 +164,8 @@ const solveHandler = async (req, res) => {
 
     const task = body.task;
     const type = String(task.type || "").toLowerCase();
-    const isAdslab = type.includes("ads") || type.includes("alcaptcha");
-    const isWaf = type === "cfwaf" || type === "waf" || type.includes("interstitial");
+    const isAdslab = type.includes("ads") || type.includes("alcaptcha") || type.includes("adslab");
+    const isWaf = type === "cfwaf" || type === "cfwaftask" || type === "waf" || type.includes("interstitial") || type.includes("cfwaf");
     // Proxy HANYA dari payload task — env tidak lagi menimpa (membersihkan alur python)
     const proxy = String(task.proxy || "").trim();
     const cookies = task.cookies || "";
