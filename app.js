@@ -44,10 +44,36 @@ if (PROFILES.length === 0) {
 } 
 
 let profileIndex = 0;
+let wafProfileIndex = 0;
 function getNextProfile() {
     const prof = PROFILES[profileIndex];
     profileIndex = (profileIndex + 1) % PROFILES.length;
     return prof;
+}
+function getNextWafProfile() {
+    const prof = PROFILES[wafProfileIndex];
+    wafProfileIndex = (wafProfileIndex + 1) % PROFILES.length;
+    return prof;
+}
+
+function getProfileUa(profilePath, fallbackUa) {
+    try {
+        const raw = JSON.parse(fs.readFileSync(profilePath, "utf8"));
+        const headers = raw && raw.transport && raw.transport.headers;
+        const ua = headers && (headers["User-Agent"] || headers["user-agent"] || headers.USER_AGENT);
+        if (ua) return String(ua);
+    } catch (e) { /* ignore */ }
+    return fallbackUa || null;
+}
+
+function redactSecrets(text, secrets = []) {
+    let out = String(text == null ? "" : text);
+    for (const value of secrets) {
+        if (value) out = out.split(String(value)).join("***");
+    }
+    return out
+        .replace(/([a-z][a-z0-9+.-]*:\/\/)([^/@\s]+)@/gi, "$1***@")
+        .slice(0, 500);
 }
 
 let tasks = {};
@@ -56,7 +82,7 @@ if (fs.existsSync(TASKS_FILE)) {
 }
 function saveTasks() { try { fs.writeFileSync(TASKS_FILE, JSON.stringify(tasks, null, 2)); } catch (e) {} }
 
-function runCfsolve(pageUrl, { proxy, sitekey, action, cdata, blankPage, mode, profilePath, ua, timeoutMs } = {}) {
+function runCfsolve(pageUrl, { proxy, sitekey, action, cdata, blankPage, mode, profilePath, ua, timeoutMs, httpTimeoutSec } = {}) {
     return new Promise((resolve, reject) => {
         const workDir = fs.mkdtempSync(path.join(os.tmpdir(), "cfsolve-"));
         const args = ["--page", pageUrl, workDir, "--solve", "--fingerprint", profilePath];
@@ -69,7 +95,16 @@ function runCfsolve(pageUrl, { proxy, sitekey, action, cdata, blankPage, mode, p
             if (cdata) args.push("--cdata", cdata);
         }
 
-        execFile(CFSOLVE_BIN, args, { timeout: timeoutMs || TASK_TIMEOUT, maxBuffer: 1024 * 1024 }, (err, stdout, stderr) => {
+        const childEnv = { ...process.env };
+        if (httpTimeoutSec) {
+            childEnv.CFSOLVE_HTTP_TIMEOUT_SECS = String(httpTimeoutSec);
+            // Hanya WAF yang mengirim httpTimeoutSec: jangan biarkan proxy env
+            // menimpa proxy dari payload task (turnstile/adslab tidak berubah).
+            for (const key of ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"]) {
+                delete childEnv[key];
+            }
+        }
+        execFile(CFSOLVE_BIN, args, { timeout: timeoutMs || TASK_TIMEOUT, maxBuffer: 1024 * 1024, env: childEnv }, (err, stdout, stderr) => {
             try { fs.rmSync(workDir, { recursive: true, force: true }); } catch {}
 
             const rawStdout = (stdout || "").toString().trim();
@@ -121,18 +156,23 @@ function runAdslab({ sitekey, siteurl, subId, proxy, cookies, ua } = {}) {
     });
 }
 
-function runCfWaf({ siteurl, proxy, cookies, ua } = {}) {
+function runCfWaf({ siteurl, proxy, cookies, ua, timeoutMs } = {}) {
     return new Promise((resolve, reject) => {
+        const childEnv = { ...process.env, PYTHONUNBUFFERED: "1", PYTHONIOENCODING: "utf-8" };
+        // WAF: proxy hanya dari payload task, jangan biarkan env override.
+        for (const key of ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"]) {
+            delete childEnv[key];
+        }
         const child = spawn(PYTHON_BIN, [WAF_RUNNER], {
-            cwd: __dirname, env: { ...process.env, PYTHONUNBUFFERED: "1", PYTHONIOENCODING: "utf-8" },
+            cwd: __dirname, env: childEnv,
             stdio: ["pipe", "pipe", "pipe"]
         });
         let stdout = "", stderr = "", settled = false;
-        let timer = setTimeout(() => { if(!settled) child.kill("SIGKILL"); }, TASK_TIMEOUT);
+        let timer = setTimeout(() => { if(!settled) child.kill("SIGKILL"); }, timeoutMs || TASK_TIMEOUT);
         const finish = (handler, value) => { if (settled) return; settled = true; clearTimeout(timer); handler(value); };
 
         child.stdout.on("data", c => { stdout += c.toString(); });
-        child.stderr.on("data", c => { stderr += c.toString(); console.error(`[WAF-Py-Err] ${c.toString().trim()}`); });
+        child.stderr.on("data", c => { stderr += c.toString(); console.error(`[WAF-Py-Err] ${redactSecrets(c.toString().trim(), [proxy, cookies])}`); });
         child.on("error", err => finish(reject, err));
         child.on("close", () => {
             try {
@@ -199,31 +239,58 @@ const solveHandler = async (req, res) => {
                     });
                 } else if (isWaf) {
                     let wafPrimaryErr = null;
-                    // Prefer cfsolve binary for challenge/interstitial pages (returns cf_clearance), fallback to Python WAF solver.
+                    // Client SF menunggu ~170s; pakai budget khusus WAF agar attempt
+                    // pertama punya waktu lebih panjang dari timeout HTTP default cfsolve.
+                    const wafBudgetMs = Math.min(160000, Math.max(timeoutMs, task.timeout ? timeoutMs : 150000));
+                    const wafDeadline = Date.now() + wafBudgetMs;
+                    // Sisiskan waktu untuk Python WAF solver bila binary gagal total (default SF ~170s).
+                    const pythonReserveMs = Math.min(30000, Math.max(5000, Math.floor(wafBudgetMs * 0.2)));
+                    const binaryDeadline = Date.now() + Math.max(10000, wafBudgetMs - pythonReserveMs);
+                    // CF/CF-WAF: binary diprioritaskan. Rotasi profil bila attempt pertama
+                    // timeout, lalu kembalikan UA profil yang dipakai cfsolve karena
+                    // cf_clearance terikat pada UA + IP yang sama.
                     if (fs.existsSync(CFSOLVE_BIN) && task.wafSolver !== "python") {
-                        try {
-                            const prof = getNextProfile();
-                            const result = await runCfsolve(websiteUrl, {
-                                proxy, sitekey: task.websiteKey || task.sitekey, action: task.action,
-                                cdata: task.cdata, blankPage: task.blankPage, mode: "challenge", profilePath: prof, ua: ua, timeoutMs
-                            });
-                            if (result && result.cf_clearance) {
-                                solution = { cf_clearance: result.cf_clearance, ua: ua || null, type: "cfsolve", profile: path.basename(path.dirname(prof)) };
-                            } else {
+                        const maxAttempts = Math.max(1, Math.min(2, PROFILES.length));
+                        const attemptBudgets = [90000, 30000];
+                        for (let attempt = 0; attempt < maxAttempts && Date.now() < binaryDeadline - 10000; attempt++) {
+                            const remaining = binaryDeadline - Date.now() - 3000;
+                            if (remaining < 20000) break;
+                            const attemptTimeout = Math.min(attemptBudgets[attempt] || 30000, Math.max(20000, remaining));
+                            const httpTimeoutSec = Math.max(20, Math.min(180, Math.floor(attemptTimeout / 1000) - 3));
+                            const prof = getNextWafProfile();
+                            const wafProfileName = path.basename(path.dirname(prof));
+                            try {
+                                const result = await runCfsolve(websiteUrl, {
+                                    proxy, sitekey: task.websiteKey || task.sitekey, action: task.action,
+                                    cdata: task.cdata, blankPage: task.blankPage, mode: "challenge",
+                                    profilePath: prof, ua, timeoutMs: attemptTimeout, httpTimeoutSec
+                                });
+                                if (result && result.cf_clearance) {
+                                    solution = {
+                                        cf_clearance: result.cf_clearance,
+                                        ua: getProfileUa(prof, ua),
+                                        type: "cfsolve",
+                                        profile: wafProfileName,
+                                        attempts: attempt + 1
+                                    };
+                                    break;
+                                }
                                 throw new Error(result && result.token ? `unexpected cfsolve output: ${String(result.token).slice(0, 220)}` : "cfsolve returned no cf_clearance");
+                            } catch (e) {
+                                wafPrimaryErr = e;
+                                console.log(`[WAF] cfsolve attempt ${attempt + 1}/${maxAttempts} (${wafProfileName}) gagal: ${redactSecrets(e.message, [proxy])}`);
                             }
-                        } catch (e) {
-                            wafPrimaryErr = e;
-                            console.log(`[WAF] cfsolve gagal, fallback python: ${e.message}`);
                         }
                     }
                     if (!solution) {
+                        // Python WAF solver tetap sebagai cadangan bila binary tidak tersedia/gagal total.
                         solution = await runCfWaf({
                             siteurl: websiteUrl,
-                            proxy: proxy, cookies: cookies, ua: ua
+                            proxy: proxy, cookies: cookies, ua: ua,
+                            timeoutMs: Math.max(10000, wafDeadline - Date.now())
                         });
                         if (wafPrimaryErr && solution && typeof solution === "object") {
-                            solution.cfsolve_fallback_error = String(wafPrimaryErr.message || wafPrimaryErr).slice(0, 300);
+                            solution.cfsolve_fallback_error = redactSecrets(wafPrimaryErr.message || wafPrimaryErr, [proxy, cookies]);
                         }
                     }
                 } else {
@@ -244,8 +311,9 @@ const solveHandler = async (req, res) => {
                 tasks[taskId] = { status: "ready", taskId, solution };
                 console.log(`[SUKSES] Task ${taskId} selesai (${type || profileName})`);
             } catch (err) {
-                tasks[taskId] = { status: "error", taskId, err: { usr: "ERROR_CAPTCHA_UNSOLVABLE", api: err.message } };
-                console.log(`[GAGAL] Task ${taskId} (${type || profileName}): ${err.message}`);
+                const safeErr = redactSecrets(err.message, [proxy, cookies]);
+                tasks[taskId] = { status: "error", taskId, err: { usr: "ERROR_CAPTCHA_UNSOLVABLE", api: safeErr } };
+                console.log(`[GAGAL] Task ${taskId} (${type || profileName}): ${safeErr}`);
             } finally {
                 saveTasks();
                 setTimeout(() => { delete tasks[taskId]; saveTasks(); }, 60000);
