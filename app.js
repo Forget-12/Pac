@@ -198,10 +198,34 @@ const solveHandler = async (req, res) => {
                         proxy: proxy, cookies: cookies, ua: ua
                     });
                 } else if (isWaf) {
-                    solution = await runCfWaf({
-                        siteurl: websiteUrl,
-                        proxy: proxy, cookies: cookies, ua: ua
-                    });
+                    let wafPrimaryErr = null;
+                    // Prefer cfsolve binary for challenge/interstitial pages (returns cf_clearance), fallback to Python WAF solver.
+                    if (fs.existsSync(CFSOLVE_BIN) && task.wafSolver !== "python") {
+                        try {
+                            const prof = getNextProfile();
+                            const result = await runCfsolve(websiteUrl, {
+                                proxy, sitekey: task.websiteKey || task.sitekey, action: task.action,
+                                cdata: task.cdata, blankPage: task.blankPage, mode: "challenge", profilePath: prof, ua: ua, timeoutMs
+                            });
+                            if (result && result.cf_clearance) {
+                                solution = { cf_clearance: result.cf_clearance, ua: ua || null, type: "cfsolve", profile: path.basename(path.dirname(prof)) };
+                            } else {
+                                throw new Error(result && result.token ? `unexpected cfsolve output: ${String(result.token).slice(0, 220)}` : "cfsolve returned no cf_clearance");
+                            }
+                        } catch (e) {
+                            wafPrimaryErr = e;
+                            console.log(`[WAF] cfsolve gagal, fallback python: ${e.message}`);
+                        }
+                    }
+                    if (!solution) {
+                        solution = await runCfWaf({
+                            siteurl: websiteUrl,
+                            proxy: proxy, cookies: cookies, ua: ua
+                        });
+                        if (wafPrimaryErr && solution && typeof solution === "object") {
+                            solution.cfsolve_fallback_error = String(wafPrimaryErr.message || wafPrimaryErr).slice(0, 300);
+                        }
+                    }
                 } else {
                     const result = await runCfsolve(websiteUrl, {
                         proxy, sitekey: task.websiteKey || task.sitekey, action: task.action,
